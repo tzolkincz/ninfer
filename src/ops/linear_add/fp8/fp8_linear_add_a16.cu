@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
 template <int K>
 void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     const auto operands = fp8_a16_operands(x, weight);
@@ -41,7 +42,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         if (x.ne[1] <= 8) return sliced.template operator()<8, 8, 2>();
     }
     if (x.ne[1] <= 16) return sliced.template operator()<16, 8, 2>();
-    if constexpr (K == 6144) {
+    if constexpr (K == Fp8N5120K6144::kInputRows || K == Fp8N5120K3072::kInputRows) {
         if (x.ne[1] <= 32) return sliced.template operator()<16, 4, 2>();
         if (x.ne[1] <= 64) return sliced.template operator()<32, 4, 1>();
     } else {
@@ -58,9 +59,25 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
 
 void fp8_linear_add_matrix_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   cudaStream_t stream) {
-    if (weight.k == 6144)
-        launch_matrix<6144>(x, weight, residual, stream);
-    else
-        launch_matrix<17408>(x, weight, residual, stream);
+    switch (resolve_fp8_geometry(weight.n, weight.k)) {
+    case Fp8GeometryId::N5120K6144:
+        return launch_matrix<Fp8N5120K6144::kInputRows>(x, weight, residual, stream);
+    case Fp8GeometryId::N5120K17408:
+        return launch_matrix<Fp8N5120K17408::kInputRows>(x, weight, residual, stream);
+    case Fp8GeometryId::N5120K3072:
+        return launch_matrix<Fp8N5120K3072::kInputRows>(x, weight, residual, stream);
+    case Fp8GeometryId::N5120K8704:
+        return launch_matrix<Fp8N5120K8704::kInputRows>(x, weight, residual, stream);
+    case Fp8GeometryId::N14336K5120:
+    case Fp8GeometryId::N16384K5120:
+    case Fp8GeometryId::N34816K5120:
+    case Fp8GeometryId::N248320K5120:
+    case Fp8GeometryId::N7168K5120:
+    case Fp8GeometryId::N8192K5120:
+    case Fp8GeometryId::N17408K5120:
+    case Fp8GeometryId::N124160K5120:
+        break;
+    }
+    throw std::invalid_argument("fp8 linear_add matrix: unsupported problem");
 }
 } // namespace ninfer::ops::detail

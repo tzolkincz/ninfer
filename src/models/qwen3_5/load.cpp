@@ -2,7 +2,10 @@
 
 #include "artifact/reader.h"
 #include "models/qwen3_5/load/bindings.h"
+#include "models/qwen3_5/load/sharding.h"
 
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -33,6 +36,8 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
+std::size_t LoadPlan::parameter_count() const { return impl_->pending.size(); }
+
 const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
     return impl_->pending.at(id.index).reference;
 }
@@ -41,11 +46,35 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
 
+namespace {
+
+void validate_tensor_parallel(const LoadOptions& options) {
+    loading::validate_tensor_parallel_ranks(options);
+    // The drafter runs on rank 0 only while the full output head is split by vocabulary rows, and
+    // the DFlash2 candidate ranking (linear_topk) has no vocabulary-split form: the drafter
+    // proposes through the optimized head, which rank 0 holds whole.
+    if (options.tp > 1 && options.masked_draft() && !options.proposal_enabled()) {
+        throw std::invalid_argument(
+            "tensor-parallel DFlash requires the optimized proposal head (--lm-head-draft)");
+    }
+}
+
+void validate_tensor_parallel(const Config& config, const LoadOptions& options) {
+    if (options.tp > 1 && config.text.architecture != Architecture::Qwen3_5) {
+        throw std::invalid_argument(std::string(architecture_name(config.text.architecture)) +
+                                    " does not support tensor parallelism");
+    }
+}
+
+} // namespace
+
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
+    validate_tensor_parallel(options);
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
-    artifact::Binder binder(reader);
+    validate_tensor_parallel(out->config, options);
+    artifact::Binder binder(reader, options.tp);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
     const auto& text  = out->config.text;
@@ -90,6 +119,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
+    loading::install_shard_resolver(binder, bindings.weights, out->config, options);
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
     out->info.name       = reader.directory().metadata.value(
@@ -106,9 +136,32 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto data    = std::move(plan.impl_);
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer);
-    auto bound   = loading::resolve_weights(std::move(data->pending), backing);
+    Model::DeviceWeights bound;
+    bound[0] = loading::resolve_weights(std::move(data->pending), backing);
     return std::unique_ptr<Model>(new Model(
-        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound), 1,
+        std::move(data->resources), std::move(data->info), std::move(backing)));
+}
+
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, ExecutionContext& execution,
+                                         const StartupObserver* observer) {
+    if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
+    const int tp = plan.impl_->options.tp;
+    if (execution.tp != tp) {
+        throw std::invalid_argument(
+            "ExecutionContext tensor parallelism differs from the load plan");
+    }
+    if (tp == 1) { return materialize_model(std::move(plan), execution.primary(), observer); }
+    auto data    = std::move(plan.impl_);
+    auto backing = artifact::materialize(*data->materialization.source,
+                                         std::move(data->materialization), execution, observer);
+    Model::DeviceWeights bound;
+    for (int device = 0; device < tp; ++device) {
+        bound[static_cast<std::size_t>(device)] =
+            loading::resolve_weights(data->pending, backing, device);
+    }
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound), tp,
         std::move(data->resources), std::move(data->info), std::move(backing)));
 }
 

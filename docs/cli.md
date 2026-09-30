@@ -208,15 +208,21 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
+| `--tp 1\|2` | tensor-parallel width; see [Two GPUs](#two-gpus) | `1` |
+| `--devices A,B` | one CUDA device per rank, rank 0 first; required with `--tp 2` | `--device` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-device N` | CUDA device that holds the Vision tower and encodes; equal to `--device` on one GPU, one of `--devices` at `--tp 2` | `--device` |
+| `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus). Without it the mailbox is probed once at startup and dropped by itself when the probe times out or exceeds 50 ms (`NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback); an exchange that hangs in a decode graph's first launch moves the MTP draft phase, then everything, to the copies (`NINFER_TP_MAILBOX_DRAFT=copies` starts with the draft phase there; `NINFER_TP_MAILBOX_FAULT=draft\|any` simulates the hang); `NINFER_TP_MAILBOX_LEGACY=1` runs the mailbox with its original exchange kernel (slower, same results); with `--spec mtp --lm-head-draft` the optimized proposal head is split by vocabulary across the two GPUs, and `NINFER_TP_DRAFT_HEAD=primary` keeps it whole on the first (slower, same results) | mailbox on without P2P, probed at startup |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
@@ -290,9 +296,56 @@ may reuse the full backing before producing the output; Text/MTP/decode work rem
 general prefix while the handoff is live. The capacity is therefore the maximum legal simultaneous
 extent, not the sum of Text, Vision scratch, and Vision output allocations. Text prefill uses
 `min(--prefill-chunk,--max-context)`; Vision keeps the existing 32,768-token aggregate prompt budget
-but plans Device execution for the registered 16,384-token maximum single item. Requests perform no
+but plans Device execution for the registered 16,384-token maximum single item, or for
+`--max-vision-tokens N`: images and videos larger than `N` tokens are then resized to at most `N`
+(one token per 32x32 pixels of an image or of two video frames), a video too long for `N` tokens is
+rejected, and the encode workspace shrinks with `N`. Requests perform no
 project-owned device allocation or growth. Context-cache capacity controls are intentionally absent
 from this one-request interface; the persistent Engine and server routes own cross-request reuse and
 optional Host backing.
 
 All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+
+## Two GPUs
+
+`--tp 2 --devices A,B` splits a dense artifact across two GPUs of the same compute capability, for
+models whose weights do not fit one device (Qwen3.8-27B NVFP4 on two 16 GB boards):
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --tp 2 --devices 0,1 \
+  --max-context 8192 --prompt "What is 17*23?"
+```
+
+Rank 0 runs on `A` and owns scheduling and sampling; `--device`, when given, must equal `A`.
+Attention heads, Gated DeltaNet heads, the MLP intermediate width and the output-head vocabulary
+are halved per rank, and every layer ends in two cross-device all-reduces. Each rank holds half of
+the KV cache and recurrent state, and both reserve the same runtime layout; `--kv-capacity auto`
+sizes it from the rank with less free memory. Direct peer access is used when the driver grants it;
+otherwise the transfers are staged through host memory, which is slower but equivalent. In CUDA
+Graph decode, a single request's all-reduces instead exchange through a small pinned host mailbox,
+one kernel per GPU, with identical results, when the GPUs have no peer access; `--no-tp-mailbox`
+keeps them on the staged copies. [`tools/tp2/mailbox_probe.cu`](../tools/README.md#standalone-tp2-mailbox-probe)
+checks the mailbox on a machine without loading a model.
+
+Tensor parallelism covers ordinary decoding, `--spec mtp` and `--spec dflash2` of the dense
+architecture with `bf16` or `int8` KV. The MTP head is split like a Text layer and verification
+runs on both ranks; `--draft-tokens` and `--lm-head-draft` work as on one GPU. The DFlash2 drafter
+runs on rank 0 alone and requires `--lm-head-draft`, since the full output head is split by
+vocabulary across the ranks; a drafter with full-attention layers is not supported.
+`--spec dflash`, the MoE architecture and the `fp8`, `nvfp4` and `k8v4` KV types are rejected at
+startup. `ninfer-perplexity` takes the same `--tp 2 --devices A,B` ([Perplexity](perplexity.md#two-gpus)).
+The split attention and Gated DeltaNet projections take FP8 or NVFP4 weights and the split MLP
+FP8 or NVFP4, so both the official mixed artifact (FP8 attention and GDN, NVFP4 MLP) and an
+all-NVFP4 recipe run at `--tp 2`; the MTP head splits only in Q8, as the official recipes store it.
+
+`--vision` works at `--tp 2` with each of these modes. The Vision tower and its encode workspace
+live on one GPU, `--vision-device` (default `A`), which must be one of `--devices`: it encodes each
+image or video item once and copies the merged embeddings to the other GPU, which holds only the
+buffer they land in. `--kv-capacity auto` sizes the KV pool from each GPU's own share, so the
+tower's GPU pays for it alone; `--max-vision-tokens` shrinks the encode workspace.
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --tp 2 --devices 0,1 \
+  --vision --vision-device 1 --max-context 8192 \
+  --messages examples/cli/messages/image_chart.json
+```

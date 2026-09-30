@@ -2,6 +2,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/attention_criteria.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
@@ -38,42 +39,7 @@ constexpr std::int32_t kNvfp4CodeBytes   = kHeadDim / 2;
 constexpr float kAttentionScale          = 0.0625f;
 constexpr std::uint16_t kOutputCanary    = 0x7fc1u;
 
-// A1 and A3 use one fixed criterion for each registered storage profile; token count, geometry,
-// execution envelope, and private launch route do not select or relax it.
-// Native INT8-G64 / FP8 Q quantization is an accepted production approximation. The unchanged
-// FP64 oracle includes its error. Small, unit-RMS and RMS1.8 Q/K fixtures qualify that budget:
-// observed relative-L2 maxima are 1.89% / 6.20%, with finite headroom below 2% / 8%.
-// These are conformance-domain budgets, not bounds for arbitrary BF16 inputs or KV quality scores.
-constexpr ReductionCriterion kAttentionBf16Criterion{
-    /*relative_l2*/ 2.8e-3,
-    /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 2.7e-3,
-};
-
-constexpr ReductionCriterion kAttentionInt8Criterion{
-    /*relative_l2*/ 2.0e-2,
-    /*gross_absolute*/ 1.1e-3,
-    /*gross_relative_to_max_reference*/ 4.0e-2,
-};
-
-constexpr ReductionCriterion kAttentionFp8Criterion{
-    /*relative_l2*/ 8.0e-2,
-    /*gross_absolute*/ 4.0e-3,
-    /*gross_relative_to_max_reference*/ 1.1e-1,
-};
-
-constexpr ReductionCriterion kAttentionNvfp4Criterion{
-    /*relative_l2*/ 1.5e-2,
-    /*gross_absolute*/ 5.0e-3,
-    /*gross_relative_to_max_reference*/ 1.1e-2,
-};
-
-constexpr ReductionCriterion kAttentionK8V4Criterion{
-    /*relative_l2*/ 8.0e-2,
-    /*gross_absolute*/ 5.0e-3,
-    /*gross_relative_to_max_reference*/ 1.1e-1,
-};
-
+ 
 struct TestVectorLayout {
     DType code_dtype;
     std::int32_t code_extent;
@@ -118,6 +84,10 @@ constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
 };
+
+// One device's half of d256-h24-kv4 under two-device tensor parallelism. Only the BF16 and INT8
+// caches register it.
+constexpr Geometry kTensorParallelGeometry{"d256-h12-kv2", 12, 2};
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
@@ -1662,15 +1632,6 @@ const char* cache_name(KvCacheStorage storage) {
     return "unknown";
 }
 
-ReductionCriterion attention_criterion(KvCacheStorage storage) {
-    if (storage == KvCacheStorage::BFloat16) return kAttentionBf16Criterion;
-    if (storage == KvCacheStorage::Int8Group64) return kAttentionInt8Criterion;
-    if (storage == KvCacheStorage::Fp8E4M3Row256) return kAttentionFp8Criterion;
-    if (storage == KvCacheStorage::Nvfp4Group16) return kAttentionNvfp4Criterion;
-    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kAttentionK8V4Criterion;
-    throw std::logic_error("unregistered causal-attention test storage");
-}
-
 int verify_attention(const std::string& label, const std::vector<double>& actual,
                      const std::vector<double>& reference, const ReductionCriterion& criterion) {
     return verify_reduction(label.c_str(), actual, reference, criterion);
@@ -2383,6 +2344,38 @@ int run_graph_envelope_cases(KvCacheStorage storage) {
     return failures;
 }
 
+int run_tensor_parallel_geometry_cases() {
+    const Geometry& geometry = kTensorParallelGeometry;
+    int failures = 0;
+    for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64})
+        failures += run_geometry(geometry, storage);
+    for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
+        // The widest chunked small-T width, then decode and verify batches.
+        failures += run_a1_case(geometry, storage, {16, 17, 48, 1601u}, MappingPattern::Identity);
+        failures +=
+            run_a3_case(geometry, storage, {16, 2041, 2057, 1602u}, MappingPattern::Fragmented);
+        failures += run_batch_case(
+            geometry, storage,
+            {1, {0, 63, 127, 2048}, {1, 1, 1, 1}, {3, 0, 2, 1}, MappingPattern::Fragmented, 1603u});
+        failures += run_batch_case(
+            geometry, storage, {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented, 1604u});
+        failures += run_batch_case(
+            geometry, storage, {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 1605u});
+    }
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+          KvCacheStorage::Fp8KeyNvfp4Value}) {
+        try {
+            (void)ops::causal_softmax_attention_workspace_capacity_bytes(op_geometry(geometry),
+                                                                         storage, {1, 64}, 1, 1, 1);
+            std::cerr << "causal_softmax_attention admitted " << geometry.name << " with a "
+                      << cache_name(storage) << "\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
+    return failures;
+}
+
 int run_quantized_causal_cases(KvCacheStorage storage) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2693,5 +2686,12 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
                   << cache_name(storage) << " public-contract correctness\n";
         failures += current;
     }
+    {
+        const int current = run_tensor_parallel_geometry_cases();
+        std::cout << (current ? "FAIL" : "PASS")
+                  << " causal_softmax_attention tensor-parallel geometry public-contract correctness\n";
+        failures += current;
+    }
+ 
     return failures ? 1 : 0;
 }

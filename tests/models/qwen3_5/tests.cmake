@@ -106,3 +106,75 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
 set_tests_properties(
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_shard_map_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shard_map.cpp"
+  LIBRARIES ninfer_model_loading)
+
+ninfer_add_test(ninfer_qwen3_5_sharded_load_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sharded_load_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+add_test(NAME ninfer_qwen3_5_sharded_load_mtp_real_test
+  COMMAND ninfer_qwen3_5_sharded_load_real_test mtp)
+
+set_tests_properties(
+  ninfer_qwen3_5_sharded_load_real_test
+  ninfer_qwen3_5_sharded_load_mtp_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_text_context_tp2_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_context_tp2.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+add_test(NAME ninfer_qwen3_5_text_context_tp2_real_test
+  COMMAND ninfer_qwen3_5_text_context_tp2_test real)
+
+set_tests_properties(
+  ninfer_qwen3_5_text_context_tp2_test
+  ninfer_qwen3_5_text_context_tp2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_engine_tp2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_tp2_real.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_engine_tp2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_engine_mtp_tp2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_mtp_tp2_real.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+add_test(NAME ninfer_qwen3_5_engine_mtp_tp2_optimized_real_test
+  COMMAND ninfer_qwen3_5_engine_mtp_tp2_real_test optimized)
+
+set_tests_properties(
+  ninfer_qwen3_5_engine_mtp_tp2_real_test
+  ninfer_qwen3_5_engine_mtp_tp2_optimized_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_engine_dflash2_tp2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_tp2_real.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_engine_dflash2_tp2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_engine_vision_tp2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_vision_tp2_real.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+add_test(NAME ninfer_qwen3_5_engine_vision_tp2_mtp_real_test
+  COMMAND ninfer_qwen3_5_engine_vision_tp2_real_test mtp)
+
+add_test(NAME ninfer_qwen3_5_engine_vision_tp2_dflash2_real_test
+  COMMAND ninfer_qwen3_5_engine_vision_tp2_real_test dflash2)
+
+set_tests_properties(
+  ninfer_qwen3_5_engine_vision_tp2_real_test
+  ninfer_qwen3_5_engine_vision_tp2_mtp_real_test
+  ninfer_qwen3_5_engine_vision_tp2_dflash2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)

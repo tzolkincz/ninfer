@@ -38,6 +38,11 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Tensor-parallel width 2 only: rank 1's operands, which every Text call built from this core
+    // (prefill, forced tokens, ordinary decode) drives in lockstep, and the bridge that enrolls
+    // rank 1's stream in a decode-graph capture.
+    const TpExecution* tp                     = nullptr;
+    const DecodeGraphPeerBridge* graph_bridge = nullptr;
 };
 
 struct PrefillContext {
@@ -55,6 +60,9 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                          = 0;
     std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Tensor-parallel width 2 under MTP: rank 1's column of the StateImage rank 0's
+    // `rewrite_checkpoint_hidden` names (the same slot of rank 1's mirror pool).
+    Tensor* peer_rewrite_checkpoint_hidden                     = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -64,6 +72,8 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Tensor-parallel width 2 only: rank 1's frame, which receives the same host ingress record.
+    qwen3_5::OrdinaryDecodeState* peer_frame = nullptr;
 };
 
 struct MtpBatchContext {
@@ -74,16 +84,24 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Tensor-parallel width 2 only: rank 1's frame, which receives the same host ingress record,
+    // and rank 1's continuation hidden store.
+    qwen3_5::MtpDecodeState* peer_frame    = nullptr;
+    Tensor* peer_continuation_hidden_store = nullptr;
 };
 
 struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_5::PagedKVCache& text_cache;
-    DFlashPersistentState& dflash;
+    DFlashPersistentState& dflash; // Rank 0's; rank 1 holds no drafter state.
     qwen3_5::DFlashDecodeState& frame;
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Tensor-parallel width 2 only: rank 1's frame, which receives the same host ingress record
+    // and rank 0's draft tokens, and rank 1's continuation hidden store.
+    qwen3_5::DFlashDecodeState* peer_frame = nullptr;
+    Tensor* peer_continuation_hidden_store = nullptr;
 };
 
 struct DFlashAppendContext {
@@ -135,6 +153,16 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);
+// Tensor-parallel width 2: both ranks verify their halves of the model, each with its own frame
+// view and ReplaySSM records. Acceptance (greedy, or sparse over `frame`'s proposal distribution)
+// runs on rank 0 alone over the gathered logits; its accepted-draft counts are copied to rank 1,
+// and both ranks select and publish their accepted hidden. `peer.replay_records` are rank 1's.
+// Only `frame` may carry a DFlash feature sink, which captures rank 0's replicated residual; `peer`
+// carries no sink and no proposal distribution.
+void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                          TextContext& card, TargetVerifyFrameView frame,
+                          TargetVerifyFrameView peer, Tensor& peer_continuation_hidden_store,
+                          ops::CausalAttentionExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,
@@ -149,16 +177,22 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
 
 struct MtpBridgeInput {
     const Tensor* previous_hidden = nullptr;
-    std::int32_t position         = 0;
+    // Rank 1's retained copy at tensor-parallel width 2; null on one device.
+    const Tensor* peer_previous_hidden = nullptr;
+    std::int32_t position              = 0;
     std::array<std::int32_t, 3> rope_position{};
 };
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
+// Resumes the MTP head at `position` from the retained target hidden of that position. At
+// tensor-parallel width 2 `peer_previous_hidden` is rank 1's retained copy (the same StateImage
+// slot of its mirror pool) and both ranks run the split head; it is null on one device.
+// `next_embedding`, when set, is rank 0's composed embedding of `next_token` (a visual column).
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
-                            const Tensor& previous_hidden, std::int32_t position,
-                            std::span<const std::int32_t> rope_position, bool build_proposal,
-                            const Tensor* next_embedding = nullptr);
+                            const Tensor& previous_hidden, const Tensor* peer_previous_hidden,
+                            std::int32_t position, std::span<const std::int32_t> rope_position,
+                            bool build_proposal, const Tensor* next_embedding = nullptr);
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge);
 

@@ -44,7 +44,7 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
             launch_fp8_a8_mma<S>(operands, output, LinearResidualAddEpilogue{{data, weight.n}},
                                    stream);
     };
-    if constexpr (K == 6144) {
+    if constexpr (K == 6144 || K == 3072) {
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
         if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R64K128>();
         if (x.ne[1] <= 192) return launch.template operator()<K6144Tma64x128>();
@@ -65,7 +65,7 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
 } // namespace
 
 std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t max_tokens) {
-    if (k == 6144) {
+    if (k == 6144 || k == 3072) {
         if (max_tokens > 768) return K6144Bulk::kPartialBytes;
         return max_tokens > 192 ? K6144MidBulk::kPartialBytes : 0;
     }
@@ -81,9 +81,29 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_add_partial_capacity_bytes(weight.k, x.ne[1]));
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    if (weight.k == 6144)
+    switch (resolve_fp8_geometry(weight.n, weight.k)) {
+    case Fp8GeometryId::N5120K6144:
         launch_problem<6144>(x, weight, residual, scratch, stream);
-    else
+        return;
+    case Fp8GeometryId::N5120K17408:
         launch_problem<17408>(x, weight, residual, scratch, stream);
+        return;
+    case Fp8GeometryId::N5120K3072:
+        launch_problem<3072>(x, weight, residual, scratch, stream);
+        return;
+    case Fp8GeometryId::N5120K8704:
+        launch_problem<8704>(x, weight, residual, scratch, stream);
+        return;
+    case Fp8GeometryId::N14336K5120:
+    case Fp8GeometryId::N16384K5120:
+    case Fp8GeometryId::N34816K5120:
+    case Fp8GeometryId::N248320K5120:
+    case Fp8GeometryId::N7168K5120:
+    case Fp8GeometryId::N8192K5120:
+    case Fp8GeometryId::N17408K5120:
+    case Fp8GeometryId::N124160K5120:
+        break;
+    }
+    throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
 } // namespace ninfer::ops::detail

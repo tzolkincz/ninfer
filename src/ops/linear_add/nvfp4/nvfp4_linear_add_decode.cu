@@ -30,9 +30,16 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
     case Nvfp4GeometryId::N5120K17408:
         launch<Nvfp4N5120K17408>(x, weight, residual, stream);
         return;
+    case Nvfp4GeometryId::N5120K8704:
+        launch<Nvfp4N5120K8704>(x, weight, residual, stream);
+        return;
+    case Nvfp4GeometryId::N5120K3072:
+        launch<Nvfp4N5120K3072>(x, weight, residual, stream);
+        return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:
     case Nvfp4GeometryId::N34816K5120:
+    case Nvfp4GeometryId::N17408K5120:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

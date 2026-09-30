@@ -164,6 +164,46 @@ int run_fp8_a8() {
         "FP8_A8", ActivationCompute::A8, make_fp8_weight,
         {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
 
+    // Two-device halves, at the A8 crossover each inherits from the problem it halves.
+    constexpr std::array attn_shard_invocations{
+        Invocation{12, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {7168, 5120, 861U, Comparison::Sampled, true, attn_shard_invocations});
+    constexpr std::array gdn_shard_invocations{
+        Invocation{11, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {8192, 5120, 863U, Comparison::Sampled, true, gdn_shard_invocations});
+    constexpr std::array mlp_shard_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {17408, 5120, 867U, Comparison::Sampled, true, mlp_shard_invocations});
+    // The output half takes the A8 floor of the fused residual projection its peer rank runs.
+    constexpr std::array output_shard_invocations{
+        Invocation{22, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {5120, 3072, 869U, Comparison::Sampled, true, output_shard_invocations});
+    constexpr std::array down_shard_invocations{
+        Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {5120, 8704, 871U, Comparison::Sampled, true, down_shard_invocations});
+
     struct Problem {
         std::int32_t rows;
         std::int32_t input_rows;
@@ -174,7 +214,9 @@ int run_fp8_a8() {
     for (const Problem problem :
          {Problem{14336, 5120, false, false}, Problem{16384, 5120, false, false},
           Problem{34816, 5120, false, false}, Problem{5120, 6144, false, false},
-          Problem{5120, 17408, false, false}}) {
+          Problem{5120, 17408, false, false}, Problem{7168, 5120, false, false},
+          Problem{8192, 5120, false, false}, Problem{17408, 5120, true, false},
+          Problem{5120, 3072, false, false}, Problem{5120, 8704, false, false}}) {
         const std::size_t one = ops::linear_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
             ops::LinearPolicy::AllowA8, 1, 1);

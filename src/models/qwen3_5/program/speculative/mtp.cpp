@@ -2,23 +2,246 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/program_impl.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include <cuda_runtime.h>
+#include <optional>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+// One rank's exact-B window into its own MtpDecodeState. Both ranks are sliced by the same
+// function, so a shape mistake cannot apply to one device only.
+struct MtpRoundView {
+    Tensor anchors;
+    Tensor frontiers;
+    Tensor budgets;
+    Tensor current_extents;
+    Tensor target_valid;
+    Tensor current_drafts;
+    Tensor target_rope;
+    Tensor text_rows;
+    Tensor mtp_rows;
+    Tensor state_sources;
+    Tensor state_destinations;
+    Tensor rope_deltas;
+    Tensor verify_ids;
+    Tensor target_positions;
+    Tensor target_tokens;
+    Tensor target_logits;
+    Tensor target_hidden;
+    Tensor selected_hidden;
+    Tensor licensed_tokens;
+    Tensor licensed_counts;
+    Tensor accepted;
+    Tensor next_extents;
+    Tensor alignment_ids;
+    Tensor alignment_hidden;
+    Tensor ar_hidden;
+    Tensor next_hidden;
+    Tensor ar_positions;
+    Tensor ar_rope_positions;
+    Tensor ar_valid_columns;
+    Tensor next_drafts;
+    Tensor proposal_logits;
+    const ops::SamplingConfig* sampling = nullptr;
+};
+
+MtpRoundView slice_mtp_frame(qwen3_5::MtpDecodeState& frame, std::int32_t batch_size) {
+    MtpRoundView out;
+    out.anchors            = frame.anchors.slice(0, 0, batch_size);
+    out.frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
+    out.budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
+    out.current_extents    = frame.current_extents.slice(0, 0, batch_size);
+    out.target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
+    out.current_drafts     = frame.current_drafts.slice(1, 0, batch_size);
+    out.target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
+    out.text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
+    out.mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
+    out.state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
+    out.state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
+    out.rope_deltas        = frame.rope_deltas.slice(0, 0, batch_size);
+    out.verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
+    out.target_positions   = frame.target_positions.slice(1, 0, batch_size);
+    out.target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
+    out.target_logits      = frame.target_logits.slice(2, 0, batch_size);
+    out.target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
+    out.selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
+    out.licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
+    out.licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
+    out.accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
+    out.next_extents       = frame.next_extents.slice(0, 0, batch_size);
+    out.alignment_ids      = frame.alignment_ids.slice(1, 0, batch_size);
+    out.alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
+    out.ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
+    out.next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
+    out.ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
+    out.ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
+    out.ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
+    out.next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+    out.proposal_logits    = frame.proposal_logits.slice(1, 0, batch_size);
+    out.sampling           = frame.sampling;
+    return out;
+}
+
+TargetVerifyFrameView verify_view(const MtpRoundView& view, const GdnReplayRecords* records) {
+    return TargetVerifyFrameView{
+        .ids                     = view.verify_ids,
+        .cache_positions         = view.target_positions,
+        .rope_positions          = view.target_rope,
+        .valid_columns           = view.target_valid,
+        .kv_table_rows           = view.text_rows,
+        .state_source_slots      = view.state_sources,
+        .state_destination_slots = view.state_destinations,
+        .target_hidden           = view.target_hidden,
+        .target_logits           = view.target_logits,
+        .target_tokens           = view.target_tokens,
+        .drafts                  = view.current_drafts,
+        .current_extents         = view.current_extents,
+        .frontiers               = view.frontiers,
+        .anchors                 = view.anchors,
+        .licensed_tokens         = view.licensed_tokens,
+        .licensed_counts         = view.licensed_counts,
+        .accepted_drafts         = view.accepted,
+        .selected_hidden         = view.selected_hidden,
+        .replay_records          = records,
+        .sampling                = view.sampling,
+    };
+}
+
+void prepare_next_round(const MtpRoundView& view, std::int32_t max_context, cudaStream_t stream) {
+    Tensor alignment_ids     = view.alignment_ids;
+    Tensor next_extents      = view.next_extents;
+    Tensor ar_positions      = view.ar_positions;
+    Tensor ar_rope_positions = view.ar_rope_positions;
+    Tensor ar_valid_columns  = view.ar_valid_columns;
+    ops::mtp_prepare_next_round(view.verify_ids, view.anchors, view.accepted, view.frontiers,
+                                view.budgets, view.licensed_counts, view.rope_deltas, alignment_ids,
+                                next_extents, ar_positions, ar_rope_positions, ar_valid_columns,
+                                max_context, stream);
+}
+
+// The bridge over both ranks. The hidden/residual axis is replicated, so each rank resumes the
+// split MTP head from its own retained copy of the target hidden, and every MTP input and KV page
+// agrees across the ranks exactly as in the prompt alignment.
+void mtp_bridge_and_propose_tp2(PrefillContext& state, const Tensor& next_token,
+                                const Tensor& previous_hidden, const Tensor& peer_previous_hidden,
+                                std::int32_t position, std::span<const std::int32_t> rope_position,
+                                bool build_proposal, const Tensor* next_embedding) {
+    const TpExecution& tp = *state.execution.tp;
+    if (!tp.mtp_complete() || !tp.mtp_kv.valid()) {
+        throw std::logic_error("tensor-parallel MTP bridge requires rank 1's MTP storage");
+    }
+    // A text position repeats on the three M-RoPE axes and runs one-axis; a visual position keeps
+    // its three axes, [1,3] on each rank as on one device.
+    const bool three_axis_rope =
+        rope_position[1] != rope_position[0] || rope_position[2] != rope_position[0];
+    const ExecutionContext& execution          = *tp.execution;
+    const DeviceContext& rank1                 = *execution.dev[1];
+    qwen3_5::MtpPrefillState& frame            = *state.execution.io.mtp;
+    const qwen3_5::MtpPrefillState& peer_frame = *tp.mtp;
+    state.execution.work.reset();
+    tp.work->reset();
+    TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
+                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &tp);
+    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
+                        state.state_destination_slot, state.mtp_proposal_extent);
+
+    TextContext::RankTensors positions{frame.target_positions.slice(0, 0, 1),
+                                       peer_frame.target_positions.slice(0, 0, 1)};
+    TextContext::RankTensors rope_positions;
+    if (three_axis_rope) {
+        rope_positions = {state.execution.work.alloc(DType::I32, {1, 3}),
+                          tp.work->alloc(DType::I32, {1, 3})};
+    } else {
+        rope_positions = {state.execution.work.alloc(DType::I32, {1}),
+                          tp.work->alloc(DType::I32, {1})};
+    }
+    const auto publish_rope = [&](Tensor& destination, cudaStream_t stream) {
+        if (three_axis_rope) {
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, rope_position.data(),
+                                       rope_position.size_bytes(), cudaMemcpyHostToDevice, stream));
+        } else {
+            ops::set_i32_scalar(destination, rope_position[0], stream);
+        }
+    };
+    ops::set_i32_scalar(positions[0], position, state.execution.device.stream);
+    publish_rope(rope_positions[0], state.execution.device.stream);
+    {
+        const ScopedCurrentDevice scope(rank1.device);
+        ops::set_i32_scalar(positions[1], position, rank1.stream);
+        publish_rope(rope_positions[1], rank1.stream);
+    }
+    const TextContext::RankTensors hidden{previous_hidden, peer_previous_hidden};
+    const TextContext::RankTensors mtp_hidden{frame.ar_hidden, peer_frame.ar_hidden};
+    Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
+    Tensor draft0             = frame.draft_tokens.slice(0, 0, 1);
+    const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
+    const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
+    card.mtp_forward_batch(next_token, hidden, positions, rope_positions, bridge_envelope,
+                           mtp_hidden, build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
+                           build_proposal ? &draft0 : nullptr, next_embedding);
+    if (!build_proposal) { return; }
+
+    if (state.mtp_proposal_extent == 0 ||
+        state.mtp_proposal_extent > static_cast<std::uint32_t>(frame.draft_tokens.ne[0])) {
+        throw std::logic_error("MTP bridge proposal extent is outside the configured window");
+    }
+    // The remaining proposal steps run as the prompt's do (prefill_impl_tp2): each rank advances
+    // its own copy of the proposal position and hidden.
+    TextContext::RankTensors ar_position{frame.position.slice(0, 0, 1),
+                                         peer_frame.position.slice(0, 0, 1)};
+    ops::set_i32_scalar(ar_position[0], position + 1, state.execution.device.stream);
+    {
+        const ScopedCurrentDevice scope(rank1.device);
+        ops::set_i32_scalar(ar_position[1], position + 1, rank1.stream);
+    }
+    for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
+        Tensor previous_token = frame.draft_tokens.slice(0, i - 1, 1);
+        Tensor next_draft     = frame.draft_tokens.slice(0, i, 1);
+        const TextContext::RankTensors next_hidden{state.execution.prefill_hidden.slice(1, i, 1),
+                                                   tp.prefill_hidden.slice(1, i, 1)};
+        const auto visible = static_cast<std::uint32_t>(position + i + 1);
+        const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
+        card.mtp_forward_ar_step(previous_token, mtp_hidden, ar_position, envelope, next_hidden,
+                                 logits, next_draft);
+        for (std::size_t r = 0; r < 2; ++r) {
+            const cudaStream_t stream = r == 0 ? state.execution.device.stream : rank1.stream;
+            const ScopedCurrentDevice scope(r == 0 ? state.execution.device.device : rank1.device);
+            CUDA_CHECK(cudaMemcpyAsync(mtp_hidden[r].data, next_hidden[r].data,
+                                       mtp_hidden[r].bytes(), cudaMemcpyDeviceToDevice, stream));
+            Tensor step_position = ar_position[r];
+            ops::increment_i32_scalar(step_position, stream);
+        }
+    }
+}
+
+} // namespace
+
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
-                            const Tensor& previous_hidden, std::int32_t position,
-                            std::span<const std::int32_t> rope_position, bool build_proposal,
-                            const Tensor* next_embedding) {
+                            const Tensor& previous_hidden, const Tensor* peer_previous_hidden,
+                            std::int32_t position, std::span<const std::int32_t> rope_position,
+                            bool build_proposal, const Tensor* next_embedding) {
     if (!state.mtp_kv.valid() || !state.execution.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
     if (rope_position.size() != 3) {
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
+    }
+    if ((state.execution.tp != nullptr) != (peer_previous_hidden != nullptr)) {
+        throw std::logic_error("MTP bridge needs rank 1's retained hidden exactly at tp 2");
+    }
+    if (state.execution.tp != nullptr) {
+        mtp_bridge_and_propose_tp2(state, next_token, previous_hidden, *peer_previous_hidden,
+                                   position, rope_position, build_proposal, next_embedding);
+        return;
     }
     state.execution.work.reset();
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
@@ -77,124 +300,186 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        const std::int32_t hidden_size =
+            dimension(state.execution.parameters.model.config().text.hidden_size);
+        const auto max_context = static_cast<std::int32_t>(state.text_cache.max_context());
+        cudaStream_t stream    = state.execution.device.stream;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+                                   stream));
+
+        // Tensor-parallel width 2: rank 1 runs the round from its own upload of the same ingress
+        // record. Everything else it needs is derived from that record by the same Ops on rank 1,
+        // except the acceptance results, which only rank 0 computes and which are copied to rank
+        // 1 (accepted counts in target_verify_accept; anchors, frontiers and licensed counts
+        // below). Rank 1 never samples or accepts, so the record's sampling configs are never
+        // read there.
+        const TpExecution* tp      = state.execution.tp;
+        const DeviceContext* rank1 = tp != nullptr ? &*tp->execution->dev[1] : nullptr;
+        std::optional<MtpRoundView> peer;
+        if (tp != nullptr) {
+            if (state.peer_frame == nullptr || state.peer_continuation_hidden_store == nullptr) {
+                throw std::logic_error("tensor-parallel MTP decode requires rank 1's frame");
+            }
+            const ScopedCurrentDevice scope(rank1->device);
+            CUDA_CHECK(cudaMemcpyAsync(state.peer_frame->ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
+                                       rank1->stream));
+            peer.emplace(slice_mtp_frame(*state.peer_frame, batch_size));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, &state.mtp_cache);
-        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
-        Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
-        Tensor current_extents    = frame.current_extents.slice(0, 0, batch_size);
-        Tensor target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor current_drafts     = frame.current_drafts.slice(1, 0, batch_size);
-        Tensor target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
-        Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
-        Tensor mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-        Tensor state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
-        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
-        Tensor rope_deltas        = frame.rope_deltas.slice(0, 0, batch_size);
-        Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
-        Tensor target_positions   = frame.target_positions.slice(1, 0, batch_size);
-        Tensor target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits      = frame.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
-        Tensor selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
-        Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
-        Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
-        Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
-        Tensor next_extents       = frame.next_extents.slice(0, 0, batch_size);
-        Tensor alignment_ids      = frame.alignment_ids.slice(1, 0, batch_size);
-        Tensor alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
-        Tensor ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
-        Tensor next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
-        Tensor ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
-        Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
-        Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
-        Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
-
-        ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
-                                               verify_ids, target_positions,
-                                               state.execution.device.stream);
+                         &state.text_cache, &state.mtp_cache, tp);
+        const MtpRoundView round = slice_mtp_frame(frame, batch_size);
+        {
+            Tensor verify_ids       = round.verify_ids;
+            Tensor target_positions = round.target_positions;
+            ops::speculative_prepare_verify_inputs(round.anchors, round.current_drafts,
+                                                   round.frontiers, round.current_extents,
+                                                   verify_ids, target_positions, stream);
+        }
+        if (peer) {
+            const ScopedCurrentDevice scope(rank1->device);
+            Tensor verify_ids       = peer->verify_ids;
+            Tensor target_positions = peer->target_positions;
+            ops::speculative_prepare_verify_inputs(peer->anchors, peer->current_drafts,
+                                                   peer->frontiers, peer->current_extents,
+                                                   verify_ids, target_positions, rank1->stream);
+        }
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                 TargetVerifyFrameView{
-                                     .ids                     = verify_ids,
-                                     .cache_positions         = target_positions,
-                                     .rope_positions          = target_rope,
-                                     .valid_columns           = target_valid,
-                                     .kv_table_rows           = text_rows,
-                                     .state_source_slots      = state_sources,
-                                     .state_destination_slots = state_destinations,
-                                     .target_hidden           = target_hidden,
-                                     .target_logits           = target_logits,
-                                     .target_tokens           = target_tokens,
-                                     .drafts                  = current_drafts,
-                                     .current_extents         = current_extents,
-                                     .frontiers               = frontiers,
-                                     .anchors                 = anchors,
-                                     .licensed_tokens         = licensed_tokens,
-                                     .licensed_counts         = licensed_counts,
-                                     .accepted_drafts         = accepted,
-                                     .selected_hidden         = selected_hidden,
-                                     .replay_records          = state.execution.replay_records,
-                                     .sampling                = frame.sampling,
-                                 },
-                                 envelopes.target_verify);
+            if (peer) {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     verify_view(round, state.execution.replay_records),
+                                     verify_view(*peer, tp->replay_records),
+                                     *state.peer_continuation_hidden_store,
+                                     envelopes.target_verify);
+            } else {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     verify_view(round, state.execution.replay_records),
+                                     envelopes.target_verify);
+            }
         }
 
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
-            ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
-                                        licensed_counts, rope_deltas, alignment_ids, next_extents,
-                                        ar_positions, ar_rope_positions, ar_valid_columns,
-                                        static_cast<std::int32_t>(state.text_cache.max_context()),
-                                        state.execution.device.stream);
-            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
-                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden);
-            ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
-                                                    state.execution.device.stream);
+            // From here on the round interleaves cross-device copies (acceptance to rank 1,
+            // proposal logits to rank 0) with the MTP head's all-reduces.
+            std::optional<ops::PeerEvents::StagedScope> staged_draft;
+            if (peer && tp->staged_draft_collectives) { staged_draft.emplace(*tp->events); }
+            prepare_next_round(round, max_context, stream);
+            if (peer) {
+                // Rank 0's acceptance updated anchors, frontiers and licensed counts in place;
+                // rank 1 pulls them and prepares its copy of the next round from the same inputs.
+                const ops::PeerEvents& events = *tp->events;
+                CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), stream));
+                const ScopedCurrentDevice scope(rank1->device);
+                CUDA_CHECK(cudaStreamWaitEvent(rank1->stream, events.inputs_ready(0), 0));
+                for (const auto& [destination, source] :
+                     {std::pair{peer->anchors, round.anchors},
+                      std::pair{peer->frontiers, round.frontiers},
+                      std::pair{peer->licensed_counts, round.licensed_counts}}) {
+                    CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
+                                               cudaMemcpyDeviceToDevice, rank1->stream));
+                }
+                prepare_next_round(*peer, max_context, rank1->stream);
+            }
 
-            Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
-            Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            Tensor draft0 = round.next_drafts.slice(1, 0, 1).view({batch_size});
+            if (peer) {
+                // The MTP head is split at tp 2: rank 0 contracts the embedding of the alignment
+                // ids and rank 1 its copy of the target hidden.
+                const TextContext::RankTensors target_hidden{round.target_hidden,
+                                                             peer->target_hidden};
+                const TextContext::RankTensors target_positions{round.target_positions,
+                                                                peer->target_positions};
+                const TextContext::RankTensors target_rope{round.target_rope, peer->target_rope};
+                const TextContext::RankTensors licensed_counts{round.licensed_counts,
+                                                               peer->licensed_counts};
+                const TextContext::RankTensors mtp_rows{round.mtp_rows, peer->mtp_rows};
+                const TextContext::RankTensors alignment_hidden{round.alignment_hidden,
+                                                                peer->alignment_hidden};
+                card.mtp_forward_decode_batch(round.alignment_ids, target_hidden, target_positions,
+                                              target_rope, licensed_counts, mtp_rows,
+                                              envelopes.batch, alignment_hidden);
+            } else {
+                Tensor alignment_hidden = round.alignment_hidden;
+                card.mtp_forward_decode_batch(round.alignment_ids, round.target_hidden,
+                                              round.target_positions, round.target_rope,
+                                              round.licensed_counts, round.mtp_rows,
+                                              envelopes.batch, alignment_hidden);
+            }
+            {
+                Tensor ar_hidden = round.ar_hidden;
+                ops::speculative_select_accepted_hidden(round.alignment_hidden, round.accepted,
+                                                        ar_hidden, stream);
+            }
+            if (peer) {
+                const ScopedCurrentDevice scope(rank1->device);
+                Tensor ar_hidden = peer->ar_hidden;
+                ops::speculative_select_accepted_hidden(peer->alignment_hidden, peer->accepted,
+                                                        ar_hidden, rank1->stream);
+            }
+
+            if (peer) {
+                const TextContext::RankTensors ar_hidden{round.ar_hidden, peer->ar_hidden};
+                Tensor proposal_logits = round.proposal_logits;
+                card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            } else {
+                Tensor proposal_logits = round.proposal_logits;
+                card.mtp_propose_batch(round.ar_hidden, proposal_logits, draft0);
+            }
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
-                Tensor previous =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
-                Tensor next =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1).view({batch_size});
-                Tensor position =
-                    ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1, batch_size});
-                Tensor rope = ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
-                                  .view({1, batch_size});
-                Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
-                                   .view({batch_size});
-                Tensor previous_batch = previous.view({1, batch_size});
-                Tensor hidden_batch   = ar_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
-                       batch_size});
-                Tensor next_hidden_batch = next_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
-                     batch_size});
-                card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
+                const auto s        = static_cast<std::int32_t>(step);
+                Tensor previous     = round.next_drafts.slice(1, s, 1).view({1, batch_size});
+                Tensor next         = round.next_drafts.slice(1, s + 1, 1).view({batch_size});
+                Tensor position     = round.ar_positions.slice(1, s, 1).view({1, batch_size});
+                Tensor rope         = round.ar_rope_positions.slice(1, s, 1).view({1, batch_size});
+                Tensor valid        = round.ar_valid_columns.slice(1, s, 1).view({batch_size});
+                Tensor hidden_batch = round.ar_hidden.view({hidden_size, 1, batch_size});
+                Tensor next_hidden_batch = round.next_hidden.view({hidden_size, 1, batch_size});
+                if (peer) {
+                    const TextContext::RankTensors hidden{
+                        hidden_batch, peer->ar_hidden.view({hidden_size, 1, batch_size})};
+                    const TextContext::RankTensors positions{
+                        position, peer->ar_positions.slice(1, s, 1).view({1, batch_size})};
+                    const TextContext::RankTensors ropes{
+                        rope, peer->ar_rope_positions.slice(1, s, 1).view({1, batch_size})};
+                    const TextContext::RankTensors valids{
+                        valid, peer->ar_valid_columns.slice(1, s, 1).view({batch_size})};
+                    const TextContext::RankTensors mtp_rows{round.mtp_rows, peer->mtp_rows};
+                    const TextContext::RankTensors next_hidden{
+                        next_hidden_batch, peer->next_hidden.view({hidden_size, 1, batch_size})};
+                    card.mtp_forward_decode_batch(previous, hidden, positions, ropes, valids,
+                                                  mtp_rows, envelopes.ar[step], next_hidden);
+                    const TextContext::RankTensors proposal_hidden{round.next_hidden,
+                                                                   peer->next_hidden};
+                    Tensor proposal_logits = round.proposal_logits;
+                    card.mtp_propose_batch(proposal_hidden, proposal_logits, next);
+                    const ScopedCurrentDevice scope(rank1->device);
+                    CUDA_CHECK(cudaMemcpyAsync(peer->ar_hidden.data, peer->next_hidden.data,
+                                               peer->ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                               rank1->stream));
+                } else {
+                    card.mtp_forward_decode_batch(previous, hidden_batch, position, rope, valid,
+                                                  round.mtp_rows, envelopes.ar[step],
+                                                  next_hidden_batch);
+                    Tensor proposal_logits = round.proposal_logits;
+                    card.mtp_propose_batch(round.next_hidden, proposal_logits, next);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(round.ar_hidden.data, round.next_hidden.data,
+                                           round.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                           stream));
             }
         }
 
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+                                   stream));
     };
 }
 

@@ -332,14 +332,19 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 }
             }
 
+            // The forced tokens prefill through the prefill KV row scalars, which a later bind or
+            // another lane's prefill step may have repointed; publish this lane's rows on every
+            // rank.
+            publish_kv_rows(sequence);
             std::uint32_t cursor = base;
             while (cursor < end) {
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
                 const StateImageSelectors selectors = state_selectors(sequence);
+                const std::optional<execution::TpExecution> tp = prefill_tp_binding(sequence);
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, tp ? &*tp : nullptr, graph_peer_bridge()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -375,12 +380,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
                 settle_state_fork(sequence);
-                copy_tail(sequence,
-                          prefill_hidden.slice(
-                              1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+                copy_tail(sequence, static_cast<std::int32_t>(result.processed_tokens) - 1);
             }
             timing.begin_wait();
-            device.synchronize();
+            synchronize_devices();
             timing.end_wait();
             work.reset();
 
@@ -405,7 +408,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
     } catch (...) {
         timing.begin_wait();
         try {
-            device.synchronize();
+            synchronize_devices();
         } catch (...) {}
         timing.end_wait();
         work.reset();
@@ -667,6 +670,14 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    // Execution rows are per lane, and the lane's next request rewrites its pinned table shadow.
+    // A cancelled prefill can still have table copies queued behind unsynchronized work; if they
+    // read the rewritten shadow, its queued step writes this request's KV into the next request's
+    // pages, shared prefix pages included. Every other path that frees a lane synchronizes first;
+    // so does a cancellation. A failure here resurfaces at the next round's synchronization.
+    try {
+        synchronize_devices();
+    } catch (...) {}
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

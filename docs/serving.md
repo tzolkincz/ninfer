@@ -72,6 +72,13 @@ selected for this process.
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
 
+An Engine-wide failure (an error thrown by the Engine worker, such as a timed-out tensor-parallel
+exchange) is permanent for the process: `ninfer-serve` logs it, stops accepting connections within
+about 250 ms and **exits with status 2** (startup failures exit with 1; a failed CUDA call aborts
+the process). Run it under a supervisor that restarts on a non-zero exit — `Restart=on-failure` in
+systemd, or llama-swap, which reloads the model on the next request — instead of relying on
+`/health`, which supervisors usually probe only while the model loads.
+
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
@@ -215,8 +222,12 @@ post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
-For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The selected template
-interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The server folds the
+other standard values onto the tiers the Qwen3.8 template distinguishes before rendering: `high`,
+`max`, and `adaptive` render as `xhigh`; `minimal` renders as `low`; `low`, `medium`, and `xhigh`
+pass through unchanged. Any other value is rejected with HTTP 400. The same folding applies to
+`reasoning.effort` (Responses) and `output_config.effort` (Messages), and it works with published
+artifacts because the template they embed is left untouched.
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
@@ -411,7 +422,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
-| `reasoning.effort` | `none` requests disabled thinking; other standard effort values pass to the selected template |
+| `reasoning.effort` | `none` requests disabled thinking; other standard effort values fold onto the template tiers as for Chat Completions (`high`, `max`, `adaptive` render as `xhigh`; `minimal` as `low`) |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -683,8 +694,8 @@ before closing the block. Request lowering reconstructs the local prompt from th
 remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
-closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the
-selected template.
+closed-turn reasoning history. `output_config.effort` folds onto the template tiers as for Chat
+Completions: `high` and `max` render as `xhigh`, `low` and `medium` pass through unchanged.
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
@@ -759,6 +770,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -766,6 +778,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
+| `--tp 1\|2` | tensor-parallel width; see [Two GPUs](#two-gpus) | `1` |
+| `--devices A,B` | one CUDA device per rank, rank 0 first; required with `--tp 2` | `--device` |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
@@ -781,12 +795,15 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-device N` | CUDA device that holds the Vision tower and encodes; one of `--devices` at `--tp 2`; see [Two GPUs](#two-gpus) | `--device` |
+| `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized and the encode workspace is planned for `N` | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus) | mailbox on without P2P |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
-| `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
+| `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
+| `--host-state-slots N` | pinned Host StateImage capacity | `8`; `0` at `--tp 2` |
+| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; `0` at `--tp 2` |
+| `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -823,6 +840,122 @@ mode and cannot be combined with any of the seven explicit context-cache capacit
 zero-valued flags.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+### Two GPUs
+
+`--tp 2 --devices A,B` serves a dense artifact split across two GPUs, for a model that does not fit
+one device:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 32768 --kv-capacity auto \
+  --max-concurrency 2 --kv-dtype int8
+```
+
+Rank 0 runs on `A` and owns admission, the context cache bookkeeping and sampling; rank 1 holds the
+other half of every attention and Gated DeltaNet head group, MLP intermediate width and output-head
+vocabulary, plus its half of the KV pages and recurrent state, whose allocation and checkpoint
+copies follow rank 0's. Both ranks reserve the same runtime layout, and `--kv-capacity auto` sizes
+it from the rank with less free memory. Prefix reuse, concurrent requests and CUDA Graph decode
+work as on one GPU.
+
+Every layer ends in two cross-device all-reduces. Prefill and eager decode move them with
+stream-ordered device-to-device copies, which the driver stages through host memory when the GPUs
+have no peer access. In CUDA Graph decode, an all-reduce of one request's activation (the hidden
+state across the verified columns) instead runs one kernel per GPU that exchanges the two halves
+through a small pinned host mailbox, which costs far less than the staged copies' event chain;
+wider multi-request payloads keep the copies. Both transports give identical results.
+The mailbox is used only when the two GPUs have no peer access (the P2P line of the startup log
+says which); with direct P2P the copies stay the transport. `--no-tp-mailbox` keeps every
+all-reduce on the copies, for comparison. If a mailbox exchange ever waits too long for the other
+GPU, the two ranks' results have diverged: the round fails with an error, and so does every later
+round, so the server must be restarted.
+
+Rank 1 has no Host copy of its KV or state, so the Host tiers are off: an omitted
+`--host-state-slots` or `--host-kv-mib` becomes `0`, and a nonzero value is rejected. Every
+checkpoint therefore lives in a Device StateImage, and the defaults raise the Device checkpoint pool
+and the private catalog to `max(2 * max-concurrency, 8)`. Without a Host tier, a private checkpoint
+captured during prefill (the turn-closure point a follow-up turn resumes from, a long-prompt anchor)
+that finds the Device pool full first releases idle retained conversations without a live session,
+least valuable and oldest first, until it fits; each release counts as a private eviction. A capture
+that still does not fit is skipped, and that conversation's next turn re-prefills from an earlier
+checkpoint or its whole prompt. On one GPU the behaviour is unchanged: with `--host-state-slots 0`
+a capture that finds the Device pool full is skipped without releasing anything.
+Each extra slot costs one StateImage per rank (about 73 MiB for Qwen3.8-27B); agentic or
+multi-conversation servers should set `--device-state-slots 12` to `16` when memory allows (on two
+16 GB boards at 196,608 tokens with Vision only 4 fit with the official NVFP4 artifact; see the
+limitations in the README). The startup log prints one
+line per rank and a `tensor parallel` capacity line with the Device checkpoint pool and the
+transfer path: `p2p on` when the driver grants direct peer access, `p2p off (host-staged copies)`
+otherwise (GeForce boards). With CUDA Graphs one `cuda graphs` line per rank compares the device
+memory graph preparation took with the planned per-device allowance, and a warning follows if a
+rank took more; startup still succeeds, the excess coming out of the memory KV sizing left free.
+The tp 2 allowance is three times what two RTX 5070 Ti measured at 32K context and
+`--max-concurrency 1`, at least 8 MiB: 8 MiB for ordinary decoding and for MTP, 11 MiB per graph
+class for DFlash2 (55 MiB for its five classes up to 32K), each multiplied by
+`--max-concurrency`.
+
+MTP speculative decoding works at `--tp 2` with the same options as on one GPU:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 32768 --kv-capacity auto \
+  --max-concurrency 2 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3
+```
+
+The MTP head is split across the ranks like a Text layer, verification and the recurrent-state
+commit run on both, and acceptance and sampling run on rank 0; `--lm-head-draft` keeps the
+optimized proposal head on rank 0 alone. Prefix reuse works as on one GPU: each rank keeps its own
+copy of the hidden state a retained prefix ends with, and the MTP head resumes from it on both.
+
+DFlash2 works at `--tp 2` with the optimized proposal head:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 32768 --kv-capacity auto \
+  --max-concurrency 2 --kv-dtype int8 \
+  --spec dflash2 --draft-tokens 4 --lm-head-draft
+```
+
+The drafter and the optimized proposal head run on rank 0 alone, and rank 0 alone holds the
+drafter's context and StateImage rings, so rank 0 has less free memory than rank 1 and
+`--kv-capacity auto` sizes the KV pool from it. Rank 1 receives the draft tokens, verification and
+the recurrent-state commit run on both ranks, and acceptance and sampling run on rank 0.
+`--lm-head-draft` is required: the full output head is split by vocabulary across the ranks,
+while the drafter ranks its candidates over one complete head.
+
+`--vision` works at `--tp 2` with every supported decoding mode. The Vision tower is loaded on one
+GPU only, `--vision-device` (default: rank 0's device, `A`); that GPU encodes each image or video
+item once and copies the merged embeddings to the other GPU, and both ranks then prefill the prompt
+with the same embeddings:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 --vision --vision-device 1 --max-vision-tokens 4096 \
+  --max-context 32768 --kv-capacity auto \
+  --max-concurrency 2 --kv-dtype int8 --spec mtp --draft-tokens 3
+```
+
+The copy goes through host memory without peer access, like the all-reduces, and costs about
+10 KiB per Vision token. Only the tower's GPU holds the Vision weights and the encode workspace; the
+other GPU holds just the handoff buffer the embeddings land in (`hidden x 2` bytes per token of the
+largest item). `--kv-capacity auto` credits the other GPU with the encode workspace it does not
+allocate, so pick the GPU with more free memory (the one without a display) as `--vision-device`.
+The encode workspace grows with the item extent: `--max-vision-tokens` below the `16384` default
+resizes larger images and videos to that many tokens and shrinks the workspace accordingly. MTP
+and DFlash2 compose with Vision as on one GPU: the MTP head and its prefix-reuse bridge read the
+visual columns on rank 0, where its token embedding lives, and the DFlash2 drafter reads rank 0's
+target features.
+
+Tensor parallelism covers ordinary decoding, `--spec mtp` and `--spec dflash2 --lm-head-draft`,
+each with or without `--vision`, with `bf16` or `int8` KV. `--spec dflash`, `--spec dflash2` without
+`--lm-head-draft` or with a drafter that has full-attention layers, the MoE architecture and the
+`fp8`, `nvfp4` and `k8v4` KV types are rejected at startup, and so is a `--vision-device` outside
+`--devices`.
 
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
@@ -950,7 +1083,7 @@ network serialization run outside the GPU executor and do not delay formation of
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
+and leaves 1 GiB of sizing headroom (`--vram-headroom-mib` changes that margin); omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request

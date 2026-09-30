@@ -78,7 +78,9 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
-        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+        // A16 is registered through T=16. Every band at both ends: decode (1), SIMT (2), then the
+        // sliced-K capacities 4 (3..4; T=3 stages one masked column), 8 (5..8) and 16 (9..16).
+        constexpr std::array<std::int32_t, 8> kA16Cases{1, 2, 3, 4, 5, 8, 9, 16};
         // Exercise both sides of the native MMA/TMA boundary, including the partial TMA tile.
         constexpr std::array<std::int32_t, 17> kA4Cases{2,   4,   5,   16,  56,  64,  65,  96,  97,
                                                         112, 128, 129, 255, 256, 257, 512, 1024};
@@ -89,6 +91,13 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+        // The two-device output-row half runs the same routes at half the gate/up rows.
+        failures += run_profile("LinearSwiGLU NVFP4_A16 half",
+                                {QType::NVFP4, 17408, 5120, 8704, 1805U, ActivationCompute::A16},
+                                kA16Cases);
+        failures += run_profile("LinearSwiGLU NVFP4_A4 half",
+                                {QType::NVFP4, 17408, 5120, 8704, 1807U, ActivationCompute::A4},
+                                kA4Cases, std::array<std::int32_t, 2>{128, 256});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -253,6 +253,157 @@ An optional proposal head supplies an indexed vocabulary subset for draft predic
 converts proposal rows to actual token IDs. Full target verification continues to use the full
 output head. Backend selection, draft width and proposal-head choice are fixed at startup.
 
+## Tensor-parallel execution
+
+A Dense model loaded with `LoadOptions.tp=2` is split across two devices by heads, intermediate
+width and vocabulary ([`sharding.h`](../../src/models/qwen3_5/load/sharding.h)); rank r holds
+`execution::Parameters(model, r)`. The hidden/residual axis is replicated. `TextContext` runs the
+split schedule when it is given a `TpExecution`
+([`tp.h`](../../src/models/qwen3_5/execution/tp.h)) naming rank 1's parameters, arena, GDN state
+pool, KV caches, prefill KV rows, ordinary decode control, the ReplaySSM records of a speculative
+backend and, under MTP, its prefill frames; without one it runs the single-device schedule
+unchanged.
+
+Each block issues one rank's work on that device's stream:
+
+```text
+h_r      = offset_rmsnorm(x, input_norm)                 replicated
+attention: q|k|gate|v_r = column_parallel(h_r)          12 query / 2 KV heads per rank (27B)
+           a_r = gated head-local attention over rank r's KV heads and pages
+GDN:       g|beta_r = column_parallel(h_r); q|k|v|z_r = column_parallel(h_r)
+           a_r = conv + recurrence over rank r's 8 key / 24 value heads and state slots
+x       += all_reduce(row_parallel(a_r))                 residual added once, by rank 0
+x       += all_reduce(row_parallel(swiglu(column_parallel(offset_rmsnorm(x, post_norm)))))
+```
+
+Both all-reduces leave the identical BF16 sum on the two ranks, so every later per-rank input
+(norms, KV pages, GDN state) agrees without further exchange. The GDN input norm runs separately
+before the split gating projection because the fused norm-and-gating Op has no split form. The
+final norm is replicated; each rank projects its half of the vocabulary, and rank 0 alone
+assembles the complete logits, where sampling runs: one cross-device copy pulls rank 1's
+contiguous `[V/2, C]` half into rank-0 staging and one kernel (`concat_rows`) interleaves both
+halves column by column (a captured 2D memcpy node could not follow the column count across graph
+profiles). Rank 1 keeps no copy of the logits, in prefill, ordinary decode, verification
+and the MTP proposals alike.
+
+Rank 1 receives its own copies of the control tensors: prefill fills its positions on device and
+reads its KV row from `TpExecution::text_kv_table_row`; ordinary decode reads
+`TpExecution::ordinary`, which the Program uploads from the same host ingress record as rank 0's.
+KV page and row bookkeeping stay on rank 0 and are mirrored to rank 1 at the same indices.
+
+The split path covers text and multimodal prefill, ordinary decode, the MTP and DFlash2 rounds and
+their logits. It rejects DFlash, the MoE FFN, paired (two-parent) input projections, and KV caches
+other than BF16 and INT8-G64, for which the 12/2-head attention has no route. RoPE has no per-rank
+override.
+
+MTP runs the same pattern over its one layer, with the MTP's own shards and KV pages:
+
+```text
+rank 0: e = offset_rmsnorm(embed(ids), embedding_norm)
+rank 1: h = offset_rmsnorm(target_hidden, hidden_norm)
+x       = all_reduce(fc_0 e + fc_1 h)                    fc split by input columns
+q|k|gate|v_r = mtp_split_attn_in(packed_r offset_rmsnorm(x, input_norm))
+x      += all_reduce(o_r gated_attention_r)              plain linear, then the residual add
+x      += all_reduce(down_r silu(gate_r) * up_r)         gate|up split by rows
+out     = offset_rmsnorm(x, final_norm)                  replicated
+```
+
+Rank 0's column half of the input projection contracts the normalized embedding and rank 1's the
+normalized hidden, so the packed input is never formed and only rank 0 embeds tokens. The
+attention input is the packed Q|K|Gate|V shard parent on every call (a rank's
+`MtpProjectionParameters::packed`, [7168,5120] for the 27B), split by `mtp_split_attn_in`; the
+separate `rows` projections the single-device prompt path uses are not read, so the KV-only and
+query-only prompt projections compute and discard the other sections. The full proposal head is
+the vocabulary-split output head, gathered before rank 0's argmax; the optimized proposal head is
+loaded on rank 0 only and its proposal runs there, so rank 1's `MtpParameters::output_head` is empty
+and unused. The Q8 MTP weights of the official artifacts use the registered Q8 halves
+(`[5120,5120]`, `[7168,5120]`, `[5120,3072]`, `[17408,5120]`, `[5120,8704]`).
+
+Verification runs the Text layers over K+1 columns with masked columns and records the ReplaySSM
+inputs of each rank's own GDN heads (the 8/24-head fold geometry); the Program folds the accepted
+prefix into both ranks' state with the same rows. Only rank 0 computes the target argmax and the
+acceptance. Rank 1 receives the accepted counts, anchors, frontiers and licensed counts by
+device-to-device copies ordered by a cross-device event, and derives everything else from its
+own upload of the same round ingress with the same Ops. The prompt MTP alignment runs on both
+ranks from each rank's final-normed chunk; rank 1 keeps its whole chunk in its own
+`prefill_hidden`.
+
+Under MTP rank 1 also retains its own copy of every target hidden the Program retains: the
+prompt and forced-token tails (`copy_tail`), the hidden of a capture frontier inside a chunk
+(written to the slot `PrefillContext::peer_rewrite_checkpoint_hidden` names), and the accepted
+column of a verification round (`target_verify_accept`) or of a partial terminal commit. Each is
+a local copy from rank 1's own replicated hidden into the same StateImage slot of its mirror
+pool, so checkpoint Forks, Moves and copies carry it with rank 0's. The MTP bridge of a resumed
+prefix runs the split head from each rank's retained copy (`TextContext::mtp_forward_batch` over
+rank arrays) and appends both ranks' MTP K/V at the bridge position. A zero-suffix reuse samples
+its first token through the vocabulary-split head from rank 0's retained hidden, which rank 1
+pulls across devices once, so it needs no rank 1 copy and works for every backend. Rank 1 keeps
+its own copy of the per-sequence RoPE delta (`TpExecution::rope_delta`): start_sequence publishes
+it with rank 0's and every prefill chunk rewrites both, and the prompt proposal steps offset each
+rank's positions by its own copy.
+
+Vision is not split. `vision/*` is placed whole on `LoadOptions::vision_rank` (the index of
+`EngineOptions::vision_device` in `devices`, rank 0 by default), so only that rank's Parameters
+hold `vision`. The encoding rank's workspace follows the single-device Vision plan (general
+prefix, encode region, item-output handoff); the other rank's (`WorkspacePlan::vision_receiver`,
+`VisionContext::plan_receiver`) is its general prefix followed by a handoff of the same extent,
+with no encode region. The per-rank reservation carries the encoding rank's workspace, and the KV
+resolution credits the other rank with the difference
+(`SequencePlanner::unallocated_reservation_bytes`). `VisionPrefillSession` encodes an item once,
+on the encoding rank's stream; the other rank's stream waits on an event for the encode, copies
+the `[H,V]` merged embeddings into its own handoff (`cudaMemcpyAsync`, staged through host memory
+without peer access), and records a second event the encoding rank's stream waits on before it may
+overwrite its handoff. The `VisionChunk` names both copies. The split multimodal prefill scatters each rank's copy
+into its own residual at the chunk's visual columns (the hidden axis is replicated, so both ranks
+hold the same embeddings) and uploads the three-axis M-RoPE positions to both ranks. Under MTP the
+shifted visual overlap is scattered into rank 0's composed input embedding, the only embedding the
+split MTP stem reads; the prompt MTP head, its final column and the prefix-reuse bridge accept
+`[T,3]` positions, and a visual bridge column passes its composed embedding to rank 0. A DFlash2
+tap reads rank 0's residual as for text.
+
+DFlash2 splits only the target. The drafter (`dflash2/*`) and the optimized proposal head
+(`proposal/*`) are placed on rank 0 alone, and the full-head proposal is rejected at width 2
+because the candidate ranking (`linear_topk`) is registered for the complete head only. A DFlash
+feature tap reads rank 0's residual after each captured layer's all-reduce, which is the complete
+hidden state, in prefill and in verification; rank 1 captures nothing. A round uploads the ingress
+record to both ranks, appends the context and proposes on rank 0, copies the draft tokens to rank
+1 after a cross-device event, prepares both ranks' verification inputs, verifies on both, accepts
+(sparse) on rank 0 and copies the accepted counts to rank 1, as for MTP. DFlash2 has no bridge;
+it resumes retained prefixes with the drafter's rings in rank 0's StateImages.
+
+The Program plans one per-rank layout (`SequencePlanImpl::tp`): KV heads and GDN state halved,
+and a workspace sized from the split schedule's own allocation order with the rank's
+`shard_text_config` extents, the all-reduce staging and the vocabulary-split logits; the ReplaySSM
+records hold one rank's heads. Rank 1 allocates the same layout without the drafter's state
+(`SequencePlanImpl::peer_persistent`: no DFlash context or features and no StateImage DFlash
+rings); its Text and MTP KV pages, execution tables and StateImages are mirrors of rank 0's. Every
+`ExecutionCore` carries the `TpExecution` (a prefill call's copy names the sequence's rank 1 MTP
+row), so prompt prefill, forced tokens, ordinary decode, MTP and DFlash2 rounds (eager and
+captured as one two-device graph) run on both ranks. The per-device CUDA Graph allowance at tp 2
+(`kTp2*Allowance` in [`startup.cpp`](../../src/models/qwen3_5/program/planning/startup.cpp))
+is max(3 x observed, 8 MiB) per topology class and batch size, from the memory `prepare_graphs()`
+consumed per rank on two RTX 5070 Ti at 32K context and concurrency 1: 2 MiB ordinary and MTP3
+(one class each, 8 MiB), 18/12 MiB on rank 0/1 for DFlash2 K=4 (five classes, 11 MiB each). The
+server logs observed against allowance per rank and warns on an overrun.
+
+The collectives have two transports ([`allreduce.h`](../../include/ninfer/ops/allreduce.h)). The
+staged transport serves every eager call and every payload wider than a mailbox slot: each rank
+pulls the peer's operand with a stream-ordered `cudaMemcpyAsync`, which the driver stages through
+host memory without peer access, ordered by the Program's `PeerEvents`, then combines locally;
+in a graph the events become edges. With CUDA Graphs the Program also owns a
+`PeerMailbox` ([`peer_mailbox.h`](../../include/ninfer/ops/peer_mailbox.h))
+attached to its `PeerEvents`, unless `EngineOptions::tp_mailbox` is false. An `allreduce_sum`
+captured with both ranks' streams in one capture and a payload within a slot (`hidden x (K+1)`
+BF16: every single-request decode, MTP-head and verification all-reduce) becomes one exchange
+kernel per device that publishes its partial to pinned host memory, releases a per-slot epoch
+flag, waits for the peer's and combines with the staged path's arithmetic, so both transports are
+bit-identical. Epoch flags need no host reset between launches, and two alternating slots cover
+any capture (see [`peer_exchange.cuh`](../../src/ops/kernel/peer_exchange.cuh)), so the pinned
+slab is `2 x 2 x slot` bytes (160 KiB for MTP3 at hidden 5120). The mailbox is declared before
+`peer_events` and the graph families and so outlives the kernels that address it. A poller that
+waits about 0.8 s sets a sticky hang word; `synchronize_devices()` checks it after every retired
+round and throws, since the ranks' results diverged.
+
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.

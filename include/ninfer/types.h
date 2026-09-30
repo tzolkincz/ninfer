@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,11 @@ inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// Bounds of EngineOptions::max_vision_tokens. One merged Vision token covers 32x32 pixels, so the
+// minimum is the registered 65,536-pixel image floor and the maximum the per-item execution
+// ceiling.
+inline constexpr std::uint32_t kMinimumMaxVisionTokens = 64;
+inline constexpr std::uint32_t kMaximumMaxVisionTokens = 16'384;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -127,8 +133,9 @@ struct StartupObserver {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
-    // Engine::options() returns those effective values.
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2; at tp 2, where every
+    // checkpoint must live in a Device StateImage, H=max(2C,8) and P=max(2C,8), and R and Host KV
+    // must be 0. Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
@@ -151,8 +158,16 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
-    EnginePurpose purpose              = EnginePurpose::Generation;
-    int device                         = 0;
+    EnginePurpose purpose = EnginePurpose::Generation;
+    int device            = 0;
+    // Tensor-parallel width, 1 or 2. At 2 the dense Text model is split across `devices`
+    // (one id per rank, rank 0 first; rank 0 must equal `device`) for generation, ordinary, with
+    // MTP or with DFlash2 speculative decoding (DFlash2 with the optimized proposal head only; its
+    // drafter runs on rank 0), with or without Vision (see `vision_device`), and for
+    // CausalScoring: DFlash, the MoE architecture, KV storage other than BF16/INT8 and the Host
+    // context-cache tiers are rejected. At 1 `devices` is empty or {device}.
+    int tp = 1;
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -166,7 +181,22 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // CUDA device that holds the Vision tower and runs its encoder; empty selects `device`. It
+    // must be one of `devices` and requires `enable_vision`. At tp 2 the other rank receives a
+    // copy of each item's merged embeddings and holds neither the tower nor its encode workspace.
+    std::optional<int> vision_device;
+    // Merged-token ceiling of one image or video item, in [kMinimumMaxVisionTokens,
+    // kMaximumMaxVisionTokens]; empty keeps the maximum. Larger images and videos are resized to
+    // at most N tokens (one token per 32x32 pixels of an image or of two video frames), a video
+    // too long for N tokens is rejected, and the Vision encode workspace is planned for N tokens.
+    // Requires `enable_vision`.
+    std::optional<std::uint32_t> max_vision_tokens;
     bool use_cuda_graph                    = true;
+    // At tp 2 with CUDA Graphs and GPUs without peer access, the captured decode all-reduces
+    // exchange through pinned host memory (ops::PeerMailbox) instead of event-ordered
+    // cross-device copies; false keeps the copies, and so does direct P2P. Both transports
+    // produce identical results. Unused at tp 1.
+    bool tp_mailbox = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -849,6 +879,11 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
+    // Device memory CUDA Graph preparation took on each tensor-parallel rank (index = rank): free
+    // memory before the eager warmups and captures minus free memory after the instantiated
+    // graphs are uploaded. The allowance above is planned per device before it; this is the
+    // observation it must cover. Zero without CUDA Graphs; entry 1 is zero at tp 1.
+    std::array<std::size_t, 2> cuda_graph_observed_bytes{};
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
@@ -993,6 +1028,18 @@ struct ContextCostSummary {
     std::filesystem::path preset_path;
 };
 
+// Resident weight bytes of one tensor-parallel rank. The sharded, replicated and local counts are
+// the placed parents' and slices' own bytes, and capacity_bytes adds the alignment between them.
+// At tp 1 every parent counts as replicated.
+struct LoadDeviceSummary {
+    int device                         = 0; // CUDA device id of this rank.
+    std::uint64_t capacity_bytes       = 0; // Weight arena, including alignment.
+    std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t sharded_bytes        = 0; // This rank's slices of row- or column-split parents.
+    std::uint64_t replicated_bytes     = 0; // Complete parents every rank holds.
+    std::uint64_t local_bytes          = 0; // Complete parents only this rank holds.
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
@@ -1006,6 +1053,28 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
+    std::vector<LoadDeviceSummary> devices; // One entry per tensor-parallel rank.
+    // tp 2: the driver granted direct peer access between the two devices. When false every
+    // cross-device transfer is staged through Host memory by CUDA. Always false at tp 1.
+    bool peer_access = false;
+    // tp 2 with CUDA Graphs: the transport of the captured all-reduces once startup is done.
+    // "mailbox" (the pinned-host mailbox passed its startup probe), "mailbox, MTP draft on copies"
+    // (NINFER_TP_MAILBOX_DRAFT=copies, or a full MTP round hung in its first launch), "copies"
+    // (cross-device copies: --no-tp-mailbox, direct peer access, no CUDA Graphs, the probe
+    // failed, or a round hung with the draft phase on copies too), empty at tp 1.
+    std::string tp_transport;
+    // Round trip of the startup probe exchange in milliseconds; 0 when no probe ran.
+    double tp_mailbox_probe_ms = 0.0;
+    // Why the mailbox was dropped or narrowed (the probe "timed out" or "took N ms", or an exchange
+    // timed out in a graph's first launch; steps joined by "; then "); empty otherwise.
+    std::string tp_mailbox_fallback;
+    // The mailbox's exchange kernel while tp_transport names the mailbox: "pipelined" (default)
+    // or "legacy" (NINFER_TP_MAILBOX_LEGACY=1, the original kernel, bit-identical results);
+    // empty otherwise.
+    std::string tp_mailbox_kernel;
+    // tp 2 MTP with the optimized proposal head: where it proposes, "split by vocabulary" (both
+    // ranks, the default) or "rank 0" (NINFER_TP_DRAFT_HEAD=primary); empty otherwise.
+    std::string tp_proposal_head;
     ContextCostSummary context_cost;
 };
 

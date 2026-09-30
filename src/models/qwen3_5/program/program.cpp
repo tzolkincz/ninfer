@@ -46,6 +46,12 @@ SequencePlanner& SequencePlanner::operator=(SequencePlanner&&) noexcept = defaul
 
 SequencePlanner::~SequencePlanner() = default;
 
+std::size_t SequencePlanner::unallocated_reservation_bytes(int rank) const noexcept {
+    return impl_ != nullptr && impl_->minimum != nullptr
+               ? impl_->minimum->unallocated_reservation_bytes(rank)
+               : 0;
+}
+
 const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
     static const runtime::SequenceCapacityCurve empty;
     return impl_ != nullptr ? impl_->curve : empty;
@@ -472,9 +478,19 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
+const TpTransportStatus& Program::tp_transport() const noexcept { return impl_->tp_transport_status; }
+
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {
-    return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
+    return SequencePlanner(
+        detail::make_sequence_planner_impl(parameters, nullptr, device, options));
+}
+
+SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
+                                      const execution::Parameters& peer_parameters,
+                                      DeviceContext& device, const EngineOptions& options) {
+    return SequencePlanner(
+        detail::make_sequence_planner_impl(parameters, &peer_parameters, device, options));
 }
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
@@ -486,6 +502,24 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     }
     auto impl =
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    plan.impl_.reset();
+    return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
+
+std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                        const execution::Parameters& peer_parameters,
+                                        SequencePlan&& plan, ExecutionContext& execution,
+                                        const StartupObserver& startup_observer) {
+    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    if (plan.impl_->parameters != &parameters) {
+        throw std::invalid_argument("sequence plan belongs to another model instance");
+    }
+    if (execution.tp != 2 || plan.impl_->tp != 2 || !execution.dev[0] || !execution.dev[1]) {
+        throw std::invalid_argument("tensor-parallel Program requires a two-device plan and "
+                                    "ExecutionContext");
+    }
+    auto impl = std::make_unique<detail::ProgramImpl>(
+        parameters, *plan.impl_, *execution.dev[0], startup_observer, &execution, &peer_parameters);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }

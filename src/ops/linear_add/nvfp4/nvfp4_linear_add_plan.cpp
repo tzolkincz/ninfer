@@ -15,16 +15,25 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
     A4,
 };
 
+// The two-device input-column halves [5120,3072] and [5120,8704] keep the crossover of the problem
+// they halve, and linear() over each half uses the same one (shapes/n5120_k3072.cu and
+// n5120_k8704.cu), so both ranks of a row-parallel projection take the same route.
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+    const bool output_family =
+        input_rows == Nvfp4N5120K6144::kInputRows || input_rows == Nvfp4N5120K3072::kInputRows;
+    const bool down_family =
+        input_rows == Nvfp4N5120K17408::kInputRows || input_rows == Nvfp4N5120K8704::kInputRows;
+    if (tokens <= 0 || output_rows != Nvfp4N5120K6144::kOutputRows ||
+        (!output_family && !down_family)) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         return Nvfp4LinearAddRoute::A16;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
-    const std::int32_t first_a4 = input_rows == 6144 ? 17 : 8;
+    const std::int32_t first_a4 =
+        output_family ? kNvfp4OutputFamilyFirstA4Tokens : kNvfp4DownFamilyFirstA4Tokens;
     return tokens >= first_a4 ? Nvfp4LinearAddRoute::A4 : Nvfp4LinearAddRoute::A16;
 }
 
@@ -45,14 +54,17 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               LinearPolicy policy, WorkspaceArena& workspace,
+                               LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;
     }
-    auto scope                     = workspace.scope();
-    const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k);
+    if (workspace == nullptr) {
+        throw std::invalid_argument("nvfp4 linear_add: A4 route requires caller workspace");
+    }
+    auto scope                     = workspace->scope();
+    const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_linear_add_a4_launch(x, weight, residual, scratch, stream);
 }
 

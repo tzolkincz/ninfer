@@ -1,12 +1,16 @@
 #include "options.h"
 #include "product/speculative_options.h"
+#include "product/tensor_parallel_options.h"
+#include "product/vision_options.h"
 
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::cli {
 namespace {
@@ -83,7 +87,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--tp 1|2 --devices A,B]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
@@ -92,19 +96,28 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
+           "       [--vision] [--vision-device N] [--max-vision-tokens N]\n"
+           "       [--no-cuda-graph] [--no-tp-mailbox]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--vision-device N places the Vision tower and its encoder on GPU N (default: rank 0);\n"
+           "it must equal --device on one GPU and be one of --devices with --tp 2.\n"
+           "--max-vision-tokens N (64-16384, default 16384) caps one image or video item's Vision\n"
+           "tokens: larger media are resized and the encode workspace is planned for N.\n"
+           "--tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A);\n"
+           "tensor parallelism supports ordinary, --spec mtp and --spec dflash2 --lm-head-draft "
+           "decoding, with or without --vision, with bf16 or int8 KV only.\n"
+           "--no-tp-mailbox keeps the captured --tp 2 all-reduces on cross-device copies.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           " MiB of sizing headroom; --vram-headroom-mib N changes that margin.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -118,6 +131,8 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_explicit      = false;
+    std::optional<std::size_t> vram_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -139,10 +154,21 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--vram-headroom-mib") {
+            const std::uint64_t mib = parse_u64(value(arg), "vram-headroom-mib");
+            if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                throw std::invalid_argument("--vram-headroom-mib is out of range");
+            }
+            vram_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
-            options.device = parse_device(value(arg));
+            options.device  = parse_device(value(arg));
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = product::parse_tp(value(arg));
+        } else if (arg == "--devices") {
+            options.devices = product::parse_devices(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -163,8 +189,14 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            options.vision_device = product::parse_device_id(value(arg));
+        } else if (arg == "--max-vision-tokens") {
+            options.max_vision_tokens = product::parse_max_vision_tokens(value(arg));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--no-tp-mailbox") {
+            options.tp_mailbox = false;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -210,6 +242,16 @@ Options parse_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+    if (vram_headroom_mib.has_value()) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
+    }
+    product::resolve_tensor_parallel_devices(options.tp, options.devices, options.device,
+                                             device_explicit);
+    product::validate_vision_options(options.enable_vision, options.vision_device,
+                                     options.max_vision_tokens, options.devices);
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

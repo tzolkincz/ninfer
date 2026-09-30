@@ -32,11 +32,24 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
+        if (state.execution.tp != nullptr) {
+            // Rank 1 reads its own upload of the same record: the same tokens, positions, KV rows
+            // (its execution tables mirror rank 0's row for row) and StateImage slots. It never
+            // samples, so the record's rank-0 sampling configs are never read there.
+            if (state.peer_frame == nullptr) {
+                throw std::logic_error("tensor-parallel decode requires rank 1's ordinary frame");
+            }
+            const DeviceContext& rank1 = *state.execution.tp->execution->dev[1];
+            const ScopedCurrentDevice scope(rank1.device);
+            CUDA_CHECK(cudaMemcpyAsync(state.peer_frame->ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_5::OrdinaryDecodeIngress),
+                                       cudaMemcpyHostToDevice, rank1.stream));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, nullptr, state.execution.tp);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -153,14 +166,23 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
                                device.stream));
 }
 
-void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
-    if (source.dtype != DType::BF16 ||
-        source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||
-        source.ne[1] != 1) {
-        throw std::logic_error("target tail hidden has an invalid shape");
+void ProgramImpl::copy_tail(SequenceState& sequence, std::int32_t column) {
+    if (column < 0 || column >= prefill_hidden.ne[1] || sequence.tail_hidden.data == nullptr) {
+        throw std::logic_error("target tail hidden column is invalid");
     }
+    const Tensor source = prefill_hidden.slice(1, column, 1);
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
                                cudaMemcpyDeviceToDevice, device.stream));
+    if (peer_retains_hidden()) {
+        // The hidden axis is replicated, so rank 1's final-normed chunk holds the same column:
+        // a local copy on rank 1's stream, after the chunk that wrote it.
+        const Tensor peer_source      = peer->prefill_hidden.slice(1, column, 1);
+        const Tensor peer_destination = peer_tail_hidden(sequence);
+        const ScopedCurrentDevice rank1(peer->device.device);
+        CUDA_CHECK(cudaMemcpyAsync(peer_destination.data, peer_source.data,
+                                   peer_destination.bytes(), cudaMemcpyDeviceToDevice,
+                                   peer->device.stream));
+    }
     sequence.tail_hidden_valid = true;
 }
 
@@ -334,12 +356,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, tp_binding(), graph_peer_bridge()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            peer ? &*peer->io.ordinary : nullptr};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -349,7 +372,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         }
         timing.end_wait();
 
@@ -386,7 +409,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
@@ -491,15 +514,18 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + draft_window));
         }
 
-        execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
-                                                  decoder->text_kv,
-                                                  *decoder->mtp_cache(),
-                                                  *io.mtp_decode,
-                                                  *mtp_host_ingress,
-                                                  *mtp_host_egress,
-                                                  state_images->continuation_hidden_store()};
+        execution::MtpBatchContext schedule_state{
+            {device, parameters, work, state_images->linear(),
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head, tp_binding(), graph_peer_bridge()},
+            decoder->text_kv,
+            *decoder->mtp_cache(),
+            *io.mtp_decode,
+            *mtp_host_ingress,
+            *mtp_host_egress,
+            state_images->continuation_hidden_store(),
+            peer ? &*peer->io.mtp_decode : nullptr,
+            peer ? &peer->state_images->continuation_hidden_store() : nullptr};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -509,7 +535,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         }
         timing.end_wait();
 
@@ -570,7 +596,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
@@ -688,13 +714,15 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, tp_binding(), graph_peer_bridge()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
             *dflash_host_ingress,
             *dflash_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            peer ? &*peer->io.dflash_decode : nullptr,
+            peer ? &peer->state_images->continuation_hidden_store() : nullptr};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -704,7 +732,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         }
         timing.end_wait();
 
@@ -764,7 +792,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            synchronize_devices();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);

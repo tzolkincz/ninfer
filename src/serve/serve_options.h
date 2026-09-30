@@ -43,11 +43,16 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
-    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    int tp                                 = 1;
+    std::vector<int> devices; // One id per tensor-parallel rank; {device} at tp 1.
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
-    bool enable_vision      = false;
+    bool enable_vision = false;
+    std::optional<int> vision_device;               // CUDA device of the Vision tower
+    std::optional<std::uint32_t> max_vision_tokens; // merged-token ceiling of one media item
     bool use_cuda_graph     = true;
+    bool tp_mailbox         = true;
     bool allow_prefix_reuse = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;

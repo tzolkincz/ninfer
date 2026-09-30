@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -211,6 +212,16 @@ int main() {
     failures += check(disabled_cache_capacity_rejected,
                       "root-only server mode accepted context-cache capacity options");
 
+    const ServeOptions auto_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
+    failures += check(auto_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          auto_headroom.kv_capacity.automatic_headroom_bytes == (2048ULL << 20),
+                      "automatic KV capacity must accept --vram-headroom-mib");
+    bool headroom_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "2048"});
+    } catch (const std::invalid_argument&) { headroom_rejected = true; }
+    failures += check(headroom_rejected, "--vram-headroom-mib without --kv-capacity auto was accepted");
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
@@ -277,7 +288,34 @@ int main() {
     failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
                           explicit_effort.enable_thinking == true,
                       "explicit reasoning effort did not remain the effective effort");
+    auto resolves_to = [&](RequestedReasoningEffort requested, ninfer::ReasoningEffort resolved) {
+        request.reasoning_effort = requested;
+        const auto folded        = resolve_prompt_semantics(request, defaults);
+        return folded.reasoning_effort == resolved && folded.enable_thinking == true;
+    };
+    failures +=
+        check(resolves_to(RequestedReasoningEffort::High, ninfer::ReasoningEffort::XHigh) &&
+                  resolves_to(RequestedReasoningEffort::Max, ninfer::ReasoningEffort::XHigh) &&
+                  resolves_to(RequestedReasoningEffort::Adaptive, ninfer::ReasoningEffort::XHigh),
+              "high, max and adaptive did not fold onto the template's xhigh tier");
+    failures += check(resolves_to(RequestedReasoningEffort::Minimal, ninfer::ReasoningEffort::Low),
+                      "minimal did not fold onto the template's low tier");
+    failures +=
+        check(resolves_to(RequestedReasoningEffort::XHigh, ninfer::ReasoningEffort::XHigh) &&
+                  resolves_to(RequestedReasoningEffort::Medium, ninfer::ReasoningEffort::Medium),
+              "template-native efforts did not pass through unchanged");
     request.reasoning_effort.reset();
+    request.chat_template_kwargs_json = R"({"reasoning_effort":"high"})";
+    failures += check(resolve_prompt_semantics(request, defaults).reasoning_effort ==
+                          ninfer::ReasoningEffort::XHigh,
+                      "nested reasoning_effort alias did not fold onto the template's xhigh tier");
+    request.chat_template_kwargs_json.clear();
+    failures += check(parse_requested_reasoning_effort("adaptive") ==
+                              RequestedReasoningEffort::Adaptive &&
+                          requested_reasoning_effort_name(RequestedReasoningEffort::Adaptive) ==
+                              "adaptive" &&
+                          !parse_requested_reasoning_effort("ultra"),
+                      "adaptive is not a wire effort value, or an unknown effort was accepted");
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == true,
                       "server preserve-thinking default was not resolved");
     request.preserve_thinking = false;
@@ -347,6 +385,58 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    const ServeOptions split =
+        parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1"});
+    failures += check(split.tp == 2 && split.devices == std::vector<int>{0, 1} &&
+                          split.device == 0 && split.context_cache.host_state_slots == 0 &&
+                          split.context_cache.host_kv_capacity_bytes == 0,
+                      "--tp 2 did not select both ranks with the Host tiers off");
+    failures += check(defaults.tp == 1 && defaults.devices == std::vector<int>{0},
+                      "serve default is not one rank on device 0");
+    const auto rejects = [](std::vector<std::string> arguments) {
+        try {
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2"}),
+                      "--tp 2 was accepted without --devices");
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+                               "--host-state-slots", "4"}),
+                      "--tp 2 accepted nonzero Host state slots");
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+                               "--host-kv-mib", "1024"}),
+                      "--tp 2 accepted a nonzero Host KV capacity");
+    failures += check(
+        rejects({"ninfer-serve", "model.ninfer", "--device", "1", "--tp", "2", "--devices", "0,1"}),
+        "--device disagreeing with the rank 0 device was accepted");
+    failures += check(!rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+                                "--host-state-slots", "0", "--host-kv-mib", "0"}),
+                      "--tp 2 rejected explicit zero Host tiers");
+    failures += check(serve_usage_text("ninfer-serve").find("--tp") != std::string::npos,
+                      "serve help omits --tp");
+    failures += check(split.tp_mailbox && !parse({"ninfer-serve", "model.ninfer", "--tp", "2",
+                                                  "--devices", "0,1", "--no-tp-mailbox"})
+                                               .tp_mailbox,
+                      "--no-tp-mailbox did not disable the captured mailbox transport");
+    const ServeOptions vision =
+        parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1", "--vision",
+               "--vision-device", "1", "--max-vision-tokens", "4096"});
+    failures += check(vision.enable_vision && vision.vision_device == 1 &&
+                          vision.max_vision_tokens == 4096U && !split.vision_device &&
+                          !split.max_vision_tokens,
+                      "--vision-device and --max-vision-tokens were not parsed");
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+                               "--vision", "--vision-device", "2"}),
+                      "--vision-device outside --devices was accepted");
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--vision-device", "0"}),
+                      "--vision-device was accepted without --vision");
+    failures += check(
+        rejects({"ninfer-serve", "model.ninfer", "--vision", "--max-vision-tokens", "63"}) &&
+            rejects({"ninfer-serve", "model.ninfer", "--vision", "--max-vision-tokens", "16385"}) &&
+            !rejects({"ninfer-serve", "model.ninfer", "--vision", "--max-vision-tokens", "64"}),
+        "--max-vision-tokens accepted a value outside [64,16384]");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

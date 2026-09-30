@@ -270,13 +270,18 @@ int main(int argc, char** argv) {
         engine_options.artifact_path      = cli.artifact_path;
         engine_options.chat_template_path = cli.chat_template_path;
         engine_options.device             = cli.device;
+        engine_options.tp                 = cli.tp;
+        engine_options.devices            = cli.devices;
         engine_options.max_context        = cli.max_context;
         engine_options.kv_capacity        = cli.kv_capacity;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;
         engine_options.speculative        = cli.speculative;
         engine_options.enable_vision      = cli.enable_vision;
+        engine_options.vision_device      = cli.vision_device;
+        engine_options.max_vision_tokens  = cli.max_vision_tokens;
         engine_options.use_cuda_graph     = cli.use_cuda_graph;
+        engine_options.tp_mailbox         = cli.tp_mailbox;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

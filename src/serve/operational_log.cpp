@@ -452,6 +452,70 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
+    if (engine.tp == 2) {
+        logger_->info("tensor parallel | tp 2 on devices {},{} | p2p {} | KV, StateImages and "
+                      "runtime reserved per rank | Host context-cache tiers off (rank 1 state has "
+                      "no Host replica) | {} Device checkpoint StateImages; a prefill checkpoint that "
+                      "finds them full first reclaims idle private continuations and is skipped "
+                      "only when none can be released (raise --device-state-slots for many "
+                      "conversations)",
+                      engine.devices.at(0), engine.devices.at(1),
+                      service.load_summary().peer_access ? "on" : "off (host-staged copies)",
+                      cache.enabled ? *cache.device_state_slots : 0U);
+        {
+            const LoadSummary& load = service.load_summary();
+            if (!load.tp_transport.empty()) {
+                const std::string kernel =
+                    load.tp_mailbox_kernel.empty()
+                        ? std::string()
+                        : " | exchange kernel " + load.tp_mailbox_kernel;
+                if (load.tp_mailbox_probe_ms > 0.0) {
+                    logger_->info(
+                        "tensor parallel | captured all-reduces: {}{} | mailbox probe {:.2f} ms",
+                        load.tp_transport, kernel, load.tp_mailbox_probe_ms);
+                } else {
+                    logger_->info("tensor parallel | captured all-reduces: {}{}", load.tp_transport,
+                                  kernel);
+                }
+            }
+            if (!load.tp_mailbox_fallback.empty() && load.tp_transport == "copies") {
+                logger_->warn("tensor parallel | pinned-host mailbox disabled: {}; decode uses the "
+                              "cross-device copies (slower). This is expected under WSL2; pass "
+                              "--no-tp-mailbox to skip the probe",
+                              load.tp_mailbox_fallback);
+            } else if (!load.tp_mailbox_fallback.empty()) {
+                logger_->warn("tensor parallel | pinned-host mailbox kept for the target forward "
+                              "only: {}; the MTP draft phase uses the cross-device copies. This "
+                              "is expected under WSL2; NINFER_TP_MAILBOX_DRAFT=copies starts "
+                              "this way directly",
+                              load.tp_mailbox_fallback);
+            }
+            if (!load.tp_proposal_head.empty()) {
+                logger_->info("tensor parallel | MTP proposal head: {}", load.tp_proposal_head);
+            }
+        }
+        // Measured against the planned per-device allowance, to calibrate the tp 2 constants.
+        // An overrun only uses device memory the KV sizing left unreserved, so it warns instead
+        // of failing startup.
+        if (engine.use_cuda_graph) {
+            constexpr double kMiB = 1024.0 * 1024.0;
+            for (std::size_t rank = 0; rank < memory.cuda_graph_observed_bytes.size(); ++rank) {
+                const std::size_t observed  = memory.cuda_graph_observed_bytes[rank];
+                const std::size_t allowance = memory.cuda_graph_allowance_bytes;
+                logger_->info("cuda graphs | rank {}: observed {:.1f} MiB, allowance {:.1f} MiB",
+                              rank, static_cast<double>(observed) / kMiB,
+                              static_cast<double>(allowance) / kMiB);
+                if (observed > allowance) {
+                    logger_->warn("cuda graphs | rank {}: observed {:.1f} MiB exceeds the "
+                                  "allowance of {:.1f} MiB; the excess comes out of the memory "
+                                  "left unreserved after KV sizing",
+                                  rank, static_cast<double>(observed) / kMiB,
+                                  static_cast<double>(allowance) / kMiB);
+                }
+            }
+        }
+    }
+
     if (cache.enabled) {
         logger_->info(
             "context cache | {} active + {} cached device states | host {} states, {} KV | "
@@ -466,7 +530,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
-        logger_->info("media | {} preprocess workers | cache {} | live {}",
+        logger_->info("media | Vision on device {} | {} preprocess workers | cache {} | live {}",
+                      service.options().vision_device.value_or(service.options().device),
                       media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
@@ -520,6 +585,11 @@ void OperationalLog::server_stopped() const { logger_->info("server stopped"); }
 void OperationalLog::server_failure(bool serving, std::string_view detail) const {
     logger_->critical("server failed during {} | {}", serving ? "serving" : "startup",
                       product::format_pretty_text(detail));
+}
+
+void OperationalLog::engine_failure() const {
+    logger_->critical("engine unavailable after an engine-wide failure | stopping the server so a "
+                      "supervisor can reload the model (exit status 2)");
 }
 
 } // namespace ninfer::serve

@@ -20,24 +20,29 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                               Tensor& key, Tensor& value, Fp8A8Workspace workspace,
                               cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    const Fp8AttentionInputOutput output{
-        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
-        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
-    const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
-    const auto launch   = [&]<class Schedule>() {
-        using S = Fp8ScheduleInstance<Schedule, 5120>;
-        if constexpr (S::kTmaSwizzle)
-            launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
-                                       workspace.partials);
-        else
-            launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
-    };
-    if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
-    if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
-    // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
-    if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
-    launch.template operator()<Bulk>();
+    visit_fp8_attn_input_problem(weight.n, [&]<class Problem>() {
+        const typename Problem::Output output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
+        const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
+        const auto launch   = [&]<class Schedule>() {
+            using S = Fp8ScheduleInstance<Schedule, 5120>;
+            // Row tiles stay within one section at the parent and at the shard.
+            static_assert((Problem::kQueryRows % S::kBlockRows) == 0);
+            static_assert((Problem::kKeyRows % S::kBlockRows) == 0);
+            if constexpr (S::kTmaSwizzle)
+                launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
+                                         workspace.partials);
+            else
+                launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+        };
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
+        if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
+        if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
+        if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
+        // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
+        if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
+        launch.template operator()<Bulk>();
+    });
 }
 } // namespace ninfer::ops::detail

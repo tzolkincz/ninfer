@@ -236,6 +236,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.device                   = options_.device;
+    engine_options.tp                       = options_.tp;
+    engine_options.devices                  = options_.devices;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;
@@ -244,7 +246,10 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.vision_device            = options_.vision_device;
+    engine_options.max_vision_tokens        = options_.max_vision_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.tp_mailbox               = options_.tp_mailbox;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;

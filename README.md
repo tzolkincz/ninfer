@@ -1,4 +1,113 @@
-# NInfer
+# NInfer — two-GPU tensor-parallel fork
+
+> **This is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)** that adds an
+> experimental two-GPU tensor-parallel mode (`--tp 2 --devices A,B`), so that Qwen3.8-27B NVFP4,
+> which does not fit one 16 GB board, runs split across two. It builds on earlier TP2 forks by
+> Wael Mansour, natpate, ivanov84 and parallelno; see [NOTICE](NOTICE) for attribution.
+>
+> - **Covered:** ordinary decoding, `--spec mtp`, `--spec dflash2 --lm-head-draft`, prefix
+>   reuse, concurrent requests, CUDA Graph decode and `--vision`, with `bf16` or `int8` KV. See
+>   [Two GPUs](docs/cli.md#two-gpus) and [serving](docs/serving.md).
+> - **Verified on:** two RTX 5070 Ti 16 GB without peer access, Linux, CUDA 13.1, core clocks
+>   capped at about 2.1 GHz. Other GPUs and P2P-capable pairs are untested.
+> - **Measured** with upstream's own benchmark suite against the published RTX 5090 runs, same
+>   weights on both. v0.2.3 with uncapped clocks (2026-09-28, about 2.9 / 2.8 GHz under load): MTP3
+>   decode on structured output 100% of the 5090 (220.0 vs 219.8 tok/s per request at C=1), plain
+>   decode 100% (70.9 vs 71.2 tok/s at 7.7k), MTP3 corpus at C=1 98% (157.1 vs 161.1 tok/s),
+>   prefill 59% at 7.7k (4,956 vs 8,340 tok/s); with the QUASAR-QAT artifact structured output 116%
+>   (254.5 tok/s), plain decode 118%, prefill 72%. v0.2.2 with the core clocks locked at 2.1 GHz (2026-09-28): plain decode 82%,
+>   MTP3 77% (corpus at C=1, 123.4 vs 161.1), prefill 50% at 7.7k; with QUASAR plain decode 88-96%,
+>   MTP3 75-87%, DFlash2 83%; the lock alone costs about 17% of decode and 14-22% of prefill. Full
+>   tables, per category and concurrency 1-8, in [Two-GPU performance](docs/performance/two-gpu.md).
+>   GSM8K 0.975-0.985, the same as vLLM on the same weights.
+> - **Related forks and prior art.** The two-GPU design originates in Wael Mansour's
+>   [ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) (August 2026, 2× RTX 5090, YaRN 1M),
+>   continued by giocom, ivanov84 (pinned-host mailbox) and parallelno (DFlash2 at tp 2), all
+>   credited in [NOTICE](NOTICE). A sibling continuation of the same line,
+>   [lynx-gt/ninfer-tp2-5060ti](https://github.com/lynx-gt/ninfer-tp2-5060ti) (upstream base of
+>   2026-08-20, qualified on 2× RTX 5060 Ti, KV tiers, `/health` self-heal, no Vision or DFlash2 at
+>   tp 2), decodes at the same rate as this fork on the same pair with the official artifact
+>   (server-side, MTP3, C=1: 128-144 vs 130-143 tok/s from 0 to 184K context, measured 2026-09-25).
+>   What this fork adds on top of that shared core is the upstream v3 base, Vision, DFlash2 and
+>   concurrent requests at tp 2, the NVFP4 split projections, and the benchmark suite comparison.
+>   A QUASAR-QAT NInfer artifact (with DFlash2) was published first by
+>   [MirkoCovizzi](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer) (2026-08-26);
+>   the one here differs in recipe and components, see its card. Single-GPU ports to other
+>   architectures exist too: [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) (sm_86).
+> - `--tp 1` is meant to behave exactly as upstream. The commits on top of upstream are grouped
+>   so that they can be proposed upstream in pieces.
+>
+> **Known limitations of the two-GPU mode** (read these before trying it on other hardware):
+>
+> - **Hardware.** Verified only on two RTX 5070 Ti 16 GB (sm_120) without peer-to-peer access,
+>   on Linux with CUDA 13.1. Other Blackwell GeForce pairs should work but are untested. A pair
+>   with peer access keeps its all-reduces on direct copies (the host mailbox is only used without
+>   P2P); that path is untested too. Exactly two GPUs: `--tp` accepts 1 or 2.
+> - **Windows via WSL2.** Reported working by [@Zeppe79](https://github.com/ValerioDolci/ninfer-tp2/issues/1)
+>   on two RTX 5070 Ti (Windows 11, WSL2 Ubuntu 24.04, CUDA 13.1 from the `wsl-ubuntu` repo): build as
+>   on Linux and keep the weights on the Linux filesystem; no flag is needed. The pinned-host
+>   mailbox works under WSL2 without `--spec` (reported 60 tok/s, against 22.5 on the cross-device
+>   copies, whose every hop costs ~220 us there instead of ~17). A full `--spec mtp` round with the
+>   mailbox hangs in its first launch instead: the engine then recaptures with the MTP draft phase
+>   on the copies and, if that hangs too, with the copies everywhere, and says so in the log
+>   (`NINFER_TP_MAILBOX_DRAFT=copies` starts with the draft phase on the copies directly). With the
+>   copies everywhere MTP3 was reported at 49 tok/s. Reaching the server from Windows needs a
+>   `netsh interface portproxy` rule to the WSL2 address, which changes at every restart.
+>   [`tools/tp2/mailbox_probe.cu`](tools/README.md#standalone-tp2-mailbox-probe) tells in seconds,
+>   without a model, whether the mailbox works on a machine.
+> - **Tuning is per GPU.** The linear-op selectors (A16→A4 crossovers, MMA bands, TMA tiles and
+>   thresholds) were measured by upstream on an RTX 5090, and the tp 2 half shapes inherit their
+>   parents' settings. On two RTX 5070 Ti the halves cost about half their parents (0.96-1.10× of
+>   parent/2 at small T), but the best thresholds differ: A4 from T=3 on the SwiGLU, down and output
+>   projections would cut ~5 % of the MTP3 round time at a measured −1.2 pt on GSM8K (500 questions),
+>   so only the neutral change (128-token TMA tile on the attention shard at T=1024) is applied. On
+>   another board, re-measure with the `bench/ops` sweeps (see [Linear tuning](docs/maintainer/linear-tuning.md))
+>   and validate with GSM8K, not only perplexity, which scores in 1024-token chunks and cannot see
+>   small-T routes.
+> - **Weights.** Verified with the Qwen3.8-27B NVFP4 artifact (`qwen3_8_27b_nvfp4.ninfer`: NVFP4
+>   MLP in layers 0-55, FP8 elsewhere) and with an all-NVFP4 conversion of the QUASAR-QAT
+>   checkpoint (every large layer projection NVFP4; GDN `a`/`b` decoded to BF16, head and embedding
+>   FP8). The split projections take FP8 or NVFP4; the MTP head splits only in Q8. The MoE model
+>   and the groupwise-int artifacts are rejected at startup (paired Q4/Q5 input projections have no
+>   split route).
+> - **Memory per board.** Each board holds half the weights plus its half of the KV cache, so the
+>   context and the number of retained conversations trade against each other:
+>   - MTP3 runs at 262,144 tokens with 4 device state slots, or at 196,608 with `--vision` and
+>     4 slots (the default 8 slots plus Vision do not fit at 196,608); the all-NVFP4 artifact
+>     (17.0 GiB of weights instead of 20.9) runs at 262,144 with `--vision` and 8 slots;
+>   - the DFlash2 drafter lives whole on the first GPU, so with the official NVFP4 artifact DFlash2
+>     stops at about 150,000 tokens; at 131,072 it starts with 2 device state slots. The QUASAR-QAT
+>     artifact with the drafter added starts at 196,608 with `--vision` and 4 slots (not at 262,144).
+> - **No host tier.** `--host-state-slots` and `--host-kv-mib` must be 0 at `--tp 2`: retained
+>   conversations live only in the device state slots. With many conversations in parallel the
+>   oldest idle ones are evicted, and their next turn is prefilled again.
+> - **Speculative decoding.** DFlash2 needs `--lm-head-draft` and a drafter without
+>   full-attention layers (the published drafter has none). `--spec dflash` is not supported.
+> - **KV cache types.** `bf16` and `int8` only; `fp8`, `nvfp4` and `k8v4` are rejected.
+> - **Where it pays off.** The gain grows with context: prompt processing is 1.5-2.1x and decode
+>   1.1x at short context to 1.65x at 184K (1.75x with uncapped clocks) against llama.cpp on the same two boards. On short
+>   prose prompts llama.cpp with MTP was about 8% faster. With v0.2.3, uncapped and with `--lm-head-draft`
+>   (2026-09-28, against the same llama.cpp numbers): 2.1x on a cold 16K prompt, 1.3x decode at short
+>   context to 1.9x at 184K, a 16-turn agent session 44% shorter, and short prose prompts 10% faster.
+>   Measured with one request at a time; concurrency is measured up to 8 requests (see the two-GPU
+>   performance page).
+> - **Numerics.** The split matmuls sum their two halves in a different order than one GPU does,
+>   so long greedy generations can drift from a single-GPU run of the same weights. Measured
+>   quality matches: GSM8K 0.975-0.98 at `--tp 2`, vLLM on the same weights 0.98.
+> - **Profilers.** Inside captured decode rounds the two GPUs wait for each other for at most
+>   about 0.8 s; if one stalls longer (a profiler that serializes kernels can do that) the engine
+>   stops serving until it is restarted. Use `--no-tp-mailbox` when profiling. At startup the
+>   engine exchanges one probe payload through the mailbox before capturing any decode graph; if
+>   the probe times out or takes more than 50 ms (WSL2's GPU virtualization is the known case) the
+>   mailbox is dropped and the captured all-reduces use the cross-device copies, with a warning in
+>   the log. `NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback. A hang in
+>   a decode graph's first launch at startup steps the transport down the same way (above) instead
+>   of stopping; `NINFER_TP_MAILBOX_FAULT=draft|any` simulates one, for testing.
+> - **Upstream.** Based on upstream `e31bc99b` (26 September 2026, merged into the fork base
+>   `bace20dc` of 24 September); later upstream changes are merged by hand.
+>
+> Below is the upstream README, with the fork's additions marked **Fork note**: its single-RTX-5090
+> statements describe upstream's product, not this fork's tested configuration.
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
@@ -17,6 +126,14 @@ Five official artifacts are available. The quick-start commands use Qwen3.8-27B 
 | Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 
+**Fork note.** This fork adds an unofficial artifact (published by the fork author, not by upstream)
+for the two-GPU mode: an all-NVFP4 conversion of the QUASAR-QAT checkpoint (17.0 GiB of weights
+instead of 20.9), verified at `--tp 2` on two 16 GB boards. It has no DFlash2 component.
+
+| Model | Weights | Artifact | Download and model card |
+|---|---|---|---|
+| Qwen3.8-27B QUASAR-QAT | `nvfp4` (all large projections), no DFlash2 | `qwen3_8_27b_quasar_nvfp4.ninfer` | [Qwen3.8-27B QUASAR-QAT NVFP4](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer) · [card and recipe](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md) |
+
 Each v3 `.ninfer` artifact carries model configuration, encoded weights, logical bindings and
 frontend resources. Runtime execution uses those facts with the implemented model and Op
 capabilities. You can also [convert your own weights](docs/weight-conversion.md), reuse an official
@@ -28,7 +145,8 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
+NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090 (or, with this fork's `--tp 2`, two
+16 GB `sm_120` boards such as the RTX 5070 Ti), a CUDA toolkit supporting `sm_120a`,
 CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
 CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
@@ -37,12 +155,26 @@ The build rejects CUDA architectures other than `sm_120a`.
 Build the product binaries:
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
+git clone https://github.com/ValerioDolci/ninfer-tp2.git
+cd ninfer-tp2
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+**Fork note — two 16 GB boards.** The single-GPU examples below need a 5090; on two 16 GB boards
+use the two-GPU mode instead (this is the configuration verified in this fork; `fp8` KV and the
+host tiers are rejected at `--tp 2`):
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer \
+  --tp 2 --devices 0,1 --kv-dtype int8 \
+  --max-context 196608 --kv-capacity 196608 --device-state-slots 4 --max-concurrency 1 \
+  --spec mtp --draft-tokens 3 --vision --vision-device 0 --max-vision-tokens 4096
+```
+
+The official `qwen3_8_27b_nvfp4.ninfer` runs with the same flags (about 2 GiB more per board);
+see [Two GPUs](docs/cli.md#two-gpus) for the option reference.
 
 Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
 the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
@@ -50,7 +182,9 @@ Python 3 interpreter. Both presets use `build/` and explicitly reset the build o
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 
-There is no install target or packaged binary distribution; run NInfer from its source build tree.
+There is no install target. The [Releases](https://github.com/ValerioDolci/ninfer-tp2/releases) page
+carries prebuilt binaries for one distribution (see [Releases](#releases)); otherwise run NInfer
+from its source build tree.
 Python tools run independently of CMake; the standalone HBM probe has its own
 [build command](tools/README.md#standalone-hbm-probe).
 
@@ -184,11 +318,35 @@ limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 
 fit the RTX 5090 after weights. Each score is one sample per problem; model cards contain the
 correct/total counts and evaluation notes.
 
+**Fork note.** The two-GPU mode and the QUASAR-QAT artifact were checked separately, with lm-evaluation-harness through
+the OpenAI route at `--tp 2` on two RTX 5070 Ti (thinking on, MTP3, one sample per problem) and compared
+per item against the same weights on vLLM 0.30: GSM8K 0.985 vs 0.975, MMLU-Pro (308) 0.789 vs 0.802,
+IFEval (200) 0.870 vs 0.880 — no paired difference is significant (exact McNemar p ≥ 0.48). COMET on
+FLORES-200 it↔en equals the official NVFP4 weights served by vLLM (0.885 / 0.891 vs 0.885 / 0.892), and
+a synthetic long-context suite at 8k/126k matches the official NVFP4 artifact on this runtime. Details,
+sources and limits are in the
+[QUASAR-QAT model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md).
+
 ## Startup notes
 
 GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
 `--vision` independently selects Vision residency. Qwen3.6-35B-A3B DFlash can be combined with
 Vision; it accelerates generated-text decode after multimodal prefill, not Vision encode itself.
+
+## Releases
+
+Each release ships a tarball `ninfer-tp2-<version>-linux-x86_64-sm120a-<distro>.tar.gz` with the
+stripped `ninfer`, `ninfer-serve` and `ninfer-perplexity` binaries, the CUDA runtime library they
+link, `serve-tp2.sh` (the two-GPU production profile, environment overrides for host, port,
+devices and context) and `SHA256SUMS`; the tarball's own digest sits next to it. The binaries link
+the distribution's FFmpeg and libcurl, so they run on that distribution (Ubuntu 26.04 for the
+current release) with an NVIDIA driver that supports CUDA 13.1; elsewhere build from source or
+use Docker. `tools/release/package.sh` builds the tarball from a Release build tree.
+
+```bash
+tar -xzf ninfer-tp2-*.tar.gz && cd ninfer-tp2-*/ && sha256sum -c SHA256SUMS
+./serve-tp2.sh models/qwen3_8_27b_quasar_nvfp4.ninfer
+```
 
 ## Docker
 
@@ -198,7 +356,9 @@ Build the runtime image on a host with the NVIDIA Container Toolkit:
 docker build --tag ninfer:local .
 ```
 
-Mount the downloaded model and run the same example server profile:
+Mount the downloaded model and run the same example server profile (**Fork note:** Docker is untested
+at `--tp 2`; for two boards pass `--gpus '"device=0,1"'` and the two-GPU flags of the quick start
+instead of the single-GPU profile below):
 
 ```bash
 docker run --rm \
@@ -242,14 +402,19 @@ and either full or optimized proposal heads.
 
 The product boundary remains intentionally small:
 
-- one RTX 5090 and one resident model per Engine;
+- one RTX 5090 (or two 16 GB boards at `--tp 2`, see the note below) and one resident model per Engine;
 - a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
-  distributed serving;
+- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU beyond
+  the experimental two-GPU mode below, or distributed serving;
 - one shared startup-fixed KV pool across active requests and retained prefixes;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;
 - the in-tree C++ headers are not distributed as an installed SDK.
+
+Note: an experimental two-GPU tensor-parallel mode (`--tp 2 --devices A,B`, see
+[Two GPUs](docs/cli.md#two-gpus)) splits a dense model across two 16 GB boards that cannot hold it
+alone. It is verified only on two RTX 5070 Ti without peer access and leaves every other point of
+the product boundary above unchanged.
 
 `--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
 used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
@@ -292,6 +457,8 @@ The published artifacts are derived from
 also uses the fixed packed weights from
 [rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
 The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
-[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
-repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). The fork's
+Qwen3.8-27B QUASAR-QAT NVFP4 artifact imports the weights of
+[QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
+(revision `15d2e47b`). These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
 under `third_party/`.

@@ -237,6 +237,13 @@ View 保留完整 parent 的几何、planes 和元素范围；原生准备按入
 共享对象只驻留一次，各使用位置保留独立的 Use。激活许可为 `A16Only={A16}`、
 `AllowA8={A16,A8}`、`AllowA4={A16,A8,A4}`；融合调用取相关 Use 的许可交集并处理所需辅助值。
 
+`LoadOptions.tp=2` 时 Dense Qwen3.5 在加载阶段按逻辑参数名切分（`qwen3_5/load/sharding.h`）：
+Attention 与 GDN 投影、MLP gate/up、`text/output_head` 按 head/中间宽度/词表分行，输出投影、
+MLP down、`mtp/input_projection` 与 GDN 卷积通道分列；norm 与 `text/token_embedding` 复制；
+Vision 只驻留在 `vision_rank`，DFlash 与 proposal 只驻留在设备 0。同一 parent 上的逻辑参数
+合成一个 parent 放置。Model 为每个设备保存一组视图，每个设备构造自己的 Parameters；
+MoE、以及读取整份 head 的设备 0 drafter（完整 proposal head）在 tp=2 下被拒绝。
+
 模型代码直接维护有限调用写法、跨 Op 融合和阶段关系；闭合计算及其 shape/格式分派属于 Op。
 Reader、binder、原生参数准备、容量查询、warmup 和实际执行各自检查所消费的合同。
 合法 artifact 的可执行范围取决于实际消费者，转换不要求完整权重组合预先注册。
@@ -539,6 +546,34 @@ Op 拥有其声明执行范围内的 Graph 更新兼容性；Program 捕获完�
 
 Prefill 成本按硬件类别与实际 Text/Vision 配置、绑定、Use 派生的 `prefill_signature` 选择测量值，
 没有匹配值时使用通用成本。成本用于规划选择，物理可行性仍由 Program 的实际布局与占用决定。
+
+### 8.1 双 GPU 张量并行
+
+完整设计（权重切分、传输、双设备 CUDA Graph、镜像状态、测试与已知限制）见[双 GPU 张量并行](tensor-parallel.md)。
+
+`EngineOptions.tp = 2` 时 Engine 为 `devices` 中的每个 rank 建立一个 `DeviceContext`，组成
+`ExecutionContext`，并在驱动允许时启用 peer access（否则 collectives 经 host staging 复制；CUDA Graph
+中单个请求激活的 all-reduce 经 pinned host mailbox 交换）。
+加载得到一个双设备 Model；`ModelInstance` 持有 rank 0 与 rank 1 的 `execution::Parameters`。
+Scheduler、ResourceManager、admission、sampling 和 request 输出仍然只在 rank 0，Engine 语义与单卡相同。
+
+Program 只有一套逻辑 store（KV address space、page、StateImage、catalog），由 rank 0 持有。
+rank 1 在 `ProgramImpl::PeerRuntime` 中分配与 rank 0 相同的 per-rank persistent/workspace 布局
+（KV heads、GDN channels 与 value heads 减半），其 KV page pool、execution tables 与 StateImage pool
+在构造时作为 rank 0 pool 的 mirror 挂接：rank 0 的每次 page zero/copy、row acquire/release/publish
+与 slot zero/copy 在 rank 1 的 stream 上以相同物理索引重放。Host tier 没有 rank 1 副本，因此 tp 2
+要求 Host State 与 Host KV 容量为 0。每次 bind、prefill step 与 forced-token prefill 都在两个 rank
+上发布同一个 prefill KV row；decode 把同一个 host ingress 上传到两个 rank 的 frame。CUDA Graph 把
+rank 1 的 stream fork/join 进 rank 0 的同一次 capture，launch 前以 rank 1 已提交的 mirror 工作为 gate。
+两个 rank 保留相同的 runtime reservation，KV 容量按空闲显存较少的 rank 求解。当前支持 dense 架构的
+ordinary、MTP 与 DFlash2（需 `--lm-head-draft`；drafter 只在 rank 0 运行）生成，可带 Vision，KV 为
+`bf16`/`int8`；DFlash、CausalScoring 与 MoE 在启动时拒绝。Vision tower 与 encode workspace 只在
+`vision_rank`（`--vision-device`）上：该 rank 编码每个 item，merged embeddings 由另一 rank 的 stream
+经事件排序复制到它自己的 handoff，两个 rank 各自 scatter 自己的副本；另一 rank 不分配 encode 区域，
+KV 求解时按差额为其预算加回。Prefix reuse 与单卡相同，包括 zero-suffix 与 MTP
+bridge：MTP 下 rank 1 在同一 StateImage slot 保留自己的 target hidden 副本，zero-suffix 的首个 token
+经词表切分的 output head 采样。没有 Host 层时 private prefill capture 的回收规则见
+[资源调度与上下文缓存](resource-scheduling-and-context-cache.md#101-retention-policy)。
 
 Serve warmup 使用同一个公共 Engine 执行路径，但其 request-level context cache 固定关闭。Warmup 可以建立
 CUDA Graph、library 和 allocator 的运行时状态，结束后不得留下可供外部请求命中的 continuation 或占用

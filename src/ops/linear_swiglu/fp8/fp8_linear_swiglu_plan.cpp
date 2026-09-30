@@ -49,13 +49,16 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 }
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                LinearPolicy policy, WorkspaceArena& workspace,
+                                LinearPolicy policy, WorkspaceArena* workspace,
                                 cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
         launch_a16(x, weight, out, stream);
         return;
     }
-    fp8_linear_swiglu_a8_launch(x, weight, out, workspace, stream);
+    if (workspace == nullptr) {
+        throw std::invalid_argument("fp8 linear_swiglu: A8 route requires caller workspace");
+    }
+    fp8_linear_swiglu_a8_launch(x, weight, out, *workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -138,15 +138,23 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept
     other.arena_ = nullptr;
 }
 
-DeviceArena::DeviceArena(std::size_t capacity_bytes) {
+DeviceArena::DeviceArena(std::size_t capacity_bytes, ZeroFill zero) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
+    void* ptr       = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    }
+    if (zero == ZeroFill::Yes) {
+        err = cudaMemset(ptr, 0, capacity_bytes);
+        if (err == cudaSuccess) { err = cudaStreamSynchronize(nullptr); }
+        if (err != cudaSuccess) {
+            free_device(ptr);
+            throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
+        }
     }
 
     base_ = ptr;

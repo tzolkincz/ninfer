@@ -8,7 +8,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 ## Organization
 
 - `artifact/` — v3 framing, directory/binding records, codecs, sharding, selected-object
-  materialization and Python-writer/C++-reader interoperability;
+  materialization, load-time parent slices and two-device placement, and Python-writer/C++-reader
+  interoperability;
 - `convert/` — source interpretation, Qwen logical mapping, recipe overrides/sharing, optional
   components, resources, proposals and numerical conversion methods;
 - `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
@@ -144,9 +145,54 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
 ```
 
+The two-device (tp 2) tests need two CUDA devices, use devices 0 and 1, and return 77 (skipped)
+with fewer. Without an artifact:
+
+- The nine op suites `ninfer_{allreduce,linear_split,output_head_split,attention_headlocal,
+  attn_input_proj_split,gdn_projections_split,gdn_headsplit,linear_swiglu_split,linear_add_split}_test`
+  qualify each column- or row-parallel form at the shard shapes, and the all-reduce and row
+  gather against FP64 and exact oracles.
+- `ninfer_artifact_sharded_materialization_tp2_test` uploads Replicated, Rows, Columns,
+  PrimaryOnly and SingleDevice parents to both devices and compares every device's bytes with
+  host-applied slices; the plan checks (`ninfer_artifact_slices_test`, `ninfer_qwen3_5_shard_map_test`, the
+  one-device `ninfer_artifact_sharded_materialization_test`) run without a second device.
+- `ninfer_qwen3_5_text_context_tp2_test` compares a synthetic two-layer model's tp 2 prefill and
+  decode logits with tp 1 and checks the rank-0 logits gather byte for byte.
+
+```bash
+ctest --test-dir build -R '_(split|headlocal|headsplit|allreduce)_test|sharded_materialization|text_context_tp2_test' \
+  --output-on-failure
+```
+
+With the artifact, split across the two devices: `ninfer_qwen3_5_sharded_load_real_test` (and its
+`sharded_load_mtp_real` variant with the MTP head) checks the per-device placement and bytes of the
+loaded model; `ninfer_qwen3_5_text_context_tp2_real_test` prefills and decodes one prompt through
+the tp 2 `TextContext`; the Engine test serves single, concurrent, prefix-reuse and one-shot flood
+requests. The MTP test compares MTP (K=3) answers with the same tp 2 model without speculation,
+checks the draft acceptance and runs two-lane MTP rounds; its prefix-reuse legs resume a retained
+~9k-token conversation through the MTP bridge on both ranks, with 4 lanes and 1 lane, and must
+give the answer of the same prompt prefilled cold and of its exact (zero-suffix) repeat. Its
+`optimized_real` variant selects the optimized proposal head. The DFlash2 test (K=4, optimized
+proposal head) requires answers identical to the tp 2 model without speculation on three short
+prompts, a nonzero acceptance, two-lane DFlash2 rounds and prefix reuse across two turns. The
+Vision test (`ninfer_qwen3_5_engine_vision_tp2_real_test`, artifact with the Vision tower) rejects
+a `vision_device` outside `devices`, requires a text answer identical with and without Vision,
+names the color of synthetic red and blue images with the tower on device 0, and requires the same
+token ids with the tower on device 1, where the embeddings are copied the other way; its
+`vision_tp2_mtp_real` and `vision_tp2_dflash2_real` variants serve the images with MTP and DFlash2
+and resume a second turn of the image conversation (with the QUASAR-QAT artifact, which has no
+DFlash2 component, the two DFlash2 variants fail with `missing component dflash2` instead of being
+skipped):
+
+```bash
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R 'ninfer_qwen3_5_(engine_((mtp|dflash2|vision)_)?tp2|sharded_load|text_context_tp2_real)' \
+  --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
-`pressure-resume` or `concurrent`; the default is `all`. These integration checks
+`pressure-resume`, `concurrent` or `forced-token-kv-row`; the default is `all`. These integration checks
 use behavior and state accounting rather than another numerical path's generated tokens as a golden.
 
 The `attention` scenario checks the selected KV type, chunked prefill, concurrent Graph decode

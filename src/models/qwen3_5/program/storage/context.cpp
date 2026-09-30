@@ -1073,22 +1073,41 @@ bool ProgramImpl::state_exclusive_to_sequence(const SequenceState& sequence,
            owned_checkpoint_references(sequence, state);
 }
 
+std::optional<std::int32_t> ProgramImpl::committed_state_slot(const SequenceState& sequence) const {
+    if (!state_store->valid(sequence.state.read) || !state_store->valid(sequence.state.write) ||
+        state_store->residency(sequence.state.read) == StateReplicaResidency::HostOnly ||
+        state_store->residency(sequence.state.write) == StateReplicaResidency::HostOnly) {
+        return std::nullopt;
+    }
+    const StateImageHandle committed =
+        sequence.state.fork_pending ? sequence.state.read : sequence.state.write;
+    return state_store->physical_slot(committed);
+}
+
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
-    if (state_store->valid(sequence.state.read) && state_store->valid(sequence.state.write) &&
-        state_store->residency(sequence.state.read) != StateReplicaResidency::HostOnly &&
-        state_store->residency(sequence.state.write) != StateReplicaResidency::HostOnly) {
-        const StateImageHandle committed =
-            sequence.state.fork_pending ? sequence.state.read : sequence.state.write;
-        sequence.tail_hidden =
-            state_images->continuation_hidden_slot(state_store->physical_slot(committed));
+    if (const std::optional<std::int32_t> slot = committed_state_slot(sequence)) {
+        sequence.tail_hidden = state_images->continuation_hidden_slot(*slot);
     }
     if (sequence.rewrite_state && state_store->valid(*sequence.rewrite_state) &&
         state_store->residency(*sequence.rewrite_state) != StateReplicaResidency::HostOnly) {
         sequence.rewrite_checkpoint_hidden = state_images->continuation_hidden_slot(
             state_store->physical_slot(*sequence.rewrite_state));
     }
+}
+
+Tensor ProgramImpl::peer_tail_hidden(const SequenceState& sequence) const {
+    if (!peer_retains_hidden()) {
+        throw std::logic_error("tensor-parallel rank 1 retains no target hidden");
+    }
+    const std::optional<std::int32_t> slot = committed_state_slot(sequence);
+    // Rank 0's view is refreshed with every binding change; the same slot names rank 1's copy.
+    if (!slot || sequence.tail_hidden.data == nullptr ||
+        state_images->continuation_hidden_slot(*slot).data != sequence.tail_hidden.data) {
+        throw std::logic_error("sequence tail hidden does not name its committed StateImage");
+    }
+    return peer->state_images->continuation_hidden_slot(*slot);
 }
 
 void ProgramImpl::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
@@ -1397,10 +1416,7 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
         }
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
-        set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+        publish_kv_rows(sequence);
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -1411,6 +1427,39 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
             }
         }
         throw;
+    }
+}
+
+void ProgramImpl::publish_kv_rows(const SequenceState& sequence) {
+    if (!sequence.kv || !text_kv_addresses->active(sequence.kv->text)) {
+        throw std::logic_error("sequence has no active KV execution mapping");
+    }
+    const std::int32_t row = text_kv_addresses->bound_row(sequence.kv->text);
+    const std::int32_t backend_row =
+        sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+    set_device_i32(io.text_kv_table_row, row);
+    set_device_i32(io.backend_kv_table_row, backend_row);
+    if (peer) {
+        // Rank 1's prefill reads its own row scalars. Its execution tables are rank 0's mirrors,
+        // so the row indices are the same; they are written whenever rank 0's are.
+        const KVExecutionRowLease& peer_row = decoder->text_kv.execution_tables().mirror_row(
+            text_kv_addresses->execution_row(sequence.kv->text).handle());
+        if (peer_row.row_index() != row) {
+            throw std::logic_error("tensor-parallel KV execution rows disagree across ranks");
+        }
+        set_peer_i32(peer->io.text_kv_table_row, row);
+        if (sequence.kv->backend) {
+            const qwen3_5::PagedKVCache* backend = backend_kv_cache();
+            if (backend == nullptr ||
+                backend->execution_tables()
+                        .mirror_row(
+                            backend_kv_addresses->execution_row(*sequence.kv->backend).handle())
+                        .row_index() != backend_row) {
+                throw std::logic_error(
+                    "tensor-parallel backend KV execution rows disagree across ranks");
+            }
+        }
+        set_peer_i32(peer->io.backend_kv_table_row, backend_row);
     }
 }
 

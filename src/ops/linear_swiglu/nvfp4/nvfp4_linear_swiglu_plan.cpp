@@ -67,9 +67,14 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, WorkspaceArena& workspace,
+                                  LinearPolicy policy, WorkspaceArena* workspace,
                                   cudaStream_t stream) {
-    switch (resolve_route(policy, x.ne[1])) {
+    const Nvfp4LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
+    if ((route == Nvfp4LinearSwiGluRoute::FusedA4 || route == Nvfp4LinearSwiGluRoute::TmaFusedA4) &&
+        workspace == nullptr) {
+        throw std::invalid_argument("nvfp4 linear_swiglu: A4 route requires caller workspace");
+    }
+    switch (route) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
@@ -77,11 +82,11 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
-        nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);
+        nvfp4_linear_swiglu_a4_launch(x, weight, out, *workspace, stream);
         return;
     case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
-        auto scope                     = workspace.scope();
-        const Nvfp4A4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
+        auto scope                     = workspace->scope();
+        const Nvfp4A4Workspace scratch = allocate_fused_workspace(*workspace, x.ne[1]);
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
         launch_nvfp4_linear_swiglu_a4_tma(
             nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),

@@ -17,7 +17,8 @@
 
 namespace ninfer {
 struct DeviceContext;
-}
+struct ExecutionContext;
+} // namespace ninfer
 
 namespace ninfer::models::qwen3_5 {
 
@@ -174,6 +175,9 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    // Bytes of the curve's per-rank reservation that `rank` does not allocate, whatever the page
+    // count: at tp 2 with Vision, the encode workspace of the rank without the tower.
+    [[nodiscard]] std::size_t unallocated_reservation_bytes(int rank) const noexcept;
     [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
 
 public:
@@ -835,6 +839,19 @@ struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
 };
 
+// The transport the captured tp 2 all-reduces use after startup; see LoadSummary::tp_transport.
+struct TpTransportStatus {
+    std::string transport; // "mailbox", "mailbox, MTP draft on copies", "copies"; empty at tp 1
+    double probe_ms = 0.0; // startup probe round trip; 0 when no probe ran
+    std::string fallback;  // why the mailbox was dropped or narrowed; empty otherwise
+    // The mailbox's exchange kernel, "pipelined" or "legacy" (NINFER_TP_MAILBOX_LEGACY=1); empty
+    // when the captured all-reduces run on the copies.
+    std::string exchange_kernel;
+    // Under MTP with the optimized proposal head: "split by vocabulary" or "rank 0"
+    // (NINFER_TP_DRAFT_HEAD=primary); empty otherwise.
+    std::string proposal_head;
+};
+
 class Program {
 public:
     ~Program() noexcept;
@@ -938,6 +955,7 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    [[nodiscard]] const TpTransportStatus& tp_transport() const noexcept;
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
@@ -945,6 +963,9 @@ private:
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                    DeviceContext&, const StartupObserver&);
+    friend std::unique_ptr<Program> create_program(const execution::Parameters&,
+                                                   const execution::Parameters&, SequencePlan&&,
+                                                   ExecutionContext&, const StartupObserver&);
 };
 
 namespace detail {
@@ -1099,8 +1120,24 @@ struct RuntimeContractAccess {
                                                     DeviceContext& device,
                                                     const EngineOptions& options);
 
+// Tensor-parallel width 2, with Parameters(model, 0) and Parameters(model, 1) of one two-device
+// Model: rank 1's Parameters supply the Vision tower when rank 1 holds it.
+[[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
+                                                    const execution::Parameters& peer_parameters,
+                                                    DeviceContext& device,
+                                                    const EngineOptions& options);
+
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
+                                                      const StartupObserver& startup_observer);
+
+// Tensor-parallel width 2: `parameters` and `peer_parameters` are Parameters(model, 0) and
+// Parameters(model, 1) of one two-device Model; rank r executes on execution.dev[r]. The plan
+// must come from a planner configured with tp 2.
+[[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                                      const execution::Parameters& peer_parameters,
+                                                      SequencePlan&& plan,
+                                                      ExecutionContext& execution,
                                                       const StartupObserver& startup_observer);
 
 } // namespace ninfer::models::qwen3_5

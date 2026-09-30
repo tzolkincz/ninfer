@@ -2,6 +2,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
 
+#include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -89,9 +90,13 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const std::int32_t first_a4 = k == 6144 ? 17 : 8;
+    // Each two-device half reads the A4 floor of the problem it halves from the same constant.
+    const std::int32_t first_a4 = k == 6144 || k == 3072
+                                      ? ops::detail::kNvfp4OutputFamilyFirstA4Tokens
+                                      : ops::detail::kNvfp4DownFamilyFirstA4Tokens;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{3, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},
         Invocation{8, ops::LinearPolicy::A16Only},
@@ -239,6 +244,12 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    // The two-device input-column half, which keeps the crossover of [5120,17408], including its
+    // TMA route from T=1024.
+    failures += run_shape(5120, 8704, 831U);
+    // The half of [5120,6144] that the attention and GDN output projections run at tp 2: it keeps
+    // the crossover of [5120,6144] and its TMA route from T=1024.
+    failures += run_shape(5120, 3072, 841U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

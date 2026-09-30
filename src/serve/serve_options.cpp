@@ -1,5 +1,7 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "product/tensor_parallel_options.h"
+#include "product/vision_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -8,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -70,6 +73,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--tp 1|2 --devices A,B] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -80,7 +84,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
+           "[--no-tp-mailbox] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -100,12 +105,24 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-device selects the CUDA device that holds the Vision tower and encodes "
+           "(default: rank 0's); it must equal --device on one GPU and be one of --devices with "
+           "--tp 2, where the other GPU only receives the encoded embeddings\n"
+           "       --max-vision-tokens caps the merged Vision tokens of one image or video item "
+           "(64-16384, default 16384): larger media are resized and the encode workspace is "
+           "planned for N\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
+           " MiB of sizing headroom; --vram-headroom-mib N changes that margin (requires auto)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
+           "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
+           "ordinary, --spec mtp or --spec dflash2 --lm-head-draft decoding, with or without "
+           "--vision, with bf16 or int8 KV; "
+           "it defaults device-state to "
+           "max(2x concurrency,8), private to max(2x concurrency,8) and the Host tiers to 0\n"
+           "       --no-tp-mailbox keeps the captured --tp 2 all-reduces on cross-device copies\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
@@ -132,6 +149,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    bool device_explicit             = false;
+    bool host_state_explicit         = false;
+    bool host_kv_explicit            = false;
+    std::optional<std::size_t> vram_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -161,6 +182,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--vram-headroom-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--vram-headroom-mib is out of range");
+            }
+            vram_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -217,6 +245,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
             context_capacity_explicit = true;
+            host_state_explicit       = true;
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
@@ -224,6 +253,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+            host_kv_explicit                             = true;
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
@@ -259,7 +289,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
-            options.device = parse_nonnegative_int(require_value("--device"), "device");
+            options.device  = parse_nonnegative_int(require_value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = product::parse_tp(require_value("--tp"));
+        } else if (arg == "--devices") {
+            options.devices = product::parse_devices(require_value("--devices"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -281,8 +316,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            options.vision_device = product::parse_device_id(require_value("--vision-device"));
+        } else if (arg == "--max-vision-tokens") {
+            options.max_vision_tokens =
+                product::parse_max_vision_tokens(require_value("--max-vision-tokens"));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--no-tp-mailbox") {
+            options.tp_mailbox = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
@@ -327,12 +369,36 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+    if (vram_headroom_mib.has_value()) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
+    }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
             throw std::invalid_argument(
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");
         }
         options.context_cache.enabled                = false;
+        options.context_cache.host_state_slots       = 0;
+        options.context_cache.host_kv_capacity_bytes = 0;
+    }
+    product::resolve_tensor_parallel_devices(options.tp, options.devices, options.device,
+                                             device_explicit);
+    product::validate_vision_options(options.enable_vision, options.vision_device,
+                                     options.max_vision_tokens, options.devices);
+    if (options.tp == 2) {
+        // Rank 1's KV pages and StateImages have no Host tier, so a tensor-parallel server keeps
+        // every checkpoint in Device StateImages. Unset Host capacities default to 0 (the Engine
+        // rejects nonzero ones); the Device StateImage and private catalog floors (Engine
+        // defaults) keep a long prompt's endpoint and anchors resident together.
+        if (host_state_explicit && options.context_cache.host_state_slots != 0) {
+            throw std::invalid_argument("--host-state-slots must be 0 with --tp 2");
+        }
+        if (host_kv_explicit && options.context_cache.host_kv_capacity_bytes != 0) {
+            throw std::invalid_argument("--host-kv-mib must be 0 with --tp 2");
+        }
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
     }

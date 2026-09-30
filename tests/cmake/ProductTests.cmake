@@ -18,6 +18,14 @@ ninfer_add_test(ninfer_perplexity_evaluation_test
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
+ninfer_add_test(ninfer_perplexity_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_options.cpp"
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/options.cpp
+  LIBRARIES ninfer_runtime_support ninfer_product_logging)
+
+target_include_directories(ninfer_perplexity_options_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/perplexity)
+
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
   LIBRARIES ninfer_runtime_support ninfer_product_logging)
@@ -55,3 +63,12 @@ ninfer_add_test(ninfer_http_error_handler_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+# Real artifact, two devices: an injected CUDA error inside the Engine worker must stop listen()
+# and mark the server as failed by the engine. Link-time wrapper, no production hooks.
+ninfer_add_test(ninfer_serve_engine_failure_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_engine_failure_real.cpp"
+  LIBRARIES ninfer_serve ninfer_product_logging CUDA::cudart)
+target_link_options(ninfer_serve_engine_failure_real_test PRIVATE
+  "LINKER:--wrap=cudaStreamSynchronize")
+set_tests_properties(ninfer_serve_engine_failure_real_test PROPERTIES SKIP_RETURN_CODE 77)

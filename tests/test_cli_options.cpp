@@ -94,6 +94,8 @@ int main() {
                       "CLI log level was not parsed");
     failures += check(help.find("--log-level") != std::string::npos,
                       "CLI help omits the log-level control");
+    failures += check(help.find("--vram-headroom-mib") != std::string::npos,
+                      "CLI help omits the VRAM headroom control");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--log-level", "verbose"});
@@ -104,5 +106,55 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    const ninfer::cli::Options single = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
+    failures += check(single.tp == 1 && single.devices == std::vector<int>{0},
+                      "CLI default is not one rank on device 0");
+    const ninfer::cli::Options split =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp", "2", "--devices", "1,0"});
+    failures += check(split.tp == 2 && split.devices == std::vector<int>{1, 0} && split.device == 1,
+                      "--tp 2 --devices did not select both ranks with rank 0 first");
+    failures +=
+        check(rejects([] {
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp", "2"});
+              }),
+              "--tp 2 was accepted without --devices");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp",
+                                       "2", "--devices", "0"});
+                      }),
+                      "--devices with fewer ids than --tp was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--device", "1", "--tp", "2", "--devices", "0,1"});
+                      }),
+                      "--device disagreeing with the rank 0 device was accepted");
+    failures +=
+        check(rejects([] {
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp", "3"});
+              }),
+              "--tp 3 was accepted");
+    failures += check(help.find("--tp") != std::string::npos, "CLI help omits --tp");
+    failures +=
+        check(split.tp_mailbox && !parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp",
+                                          "2", "--devices", "1,0", "--no-tp-mailbox"})
+                                       .tp_mailbox,
+              "--no-tp-mailbox did not disable the captured mailbox transport");
+    const ninfer::cli::Options vision =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp", "2", "--devices", "1,0",
+               "--vision", "--vision-device", "0", "--max-vision-tokens", "1024"});
+    failures += check(vision.vision_device == 0 && vision.max_vision_tokens == 1024U &&
+                          !split.vision_device && !split.max_vision_tokens,
+                      "--vision-device and --max-vision-tokens were not parsed");
+    failures +=
+        check(rejects([] {
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--tp", "2",
+                               "--devices", "0,1", "--vision", "--vision-device", "3"});
+              }),
+              "--vision-device outside --devices was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--max-vision-tokens", "1024"});
+                      }),
+                      "--max-vision-tokens was accepted without --vision");
     return failures == 0 ? 0 : 1;
 }
