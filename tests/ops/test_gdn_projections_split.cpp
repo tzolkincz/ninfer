@@ -964,13 +964,13 @@ int verify_registry() {
     int failures = verify_section_map();
     for (const ops::LinearPolicy policy :
          {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
-        for (const std::int32_t tokens : {1, 7, 8, 1024}) {
+        for (const std::int32_t tokens : {1, 7, 8, 16, 17, 1024}) {
             failures += expect_accepted("gdn_input workspace", [&] {
                 const std::size_t bytes =
                     ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
                         kFp8, kShardRows, kHidden, policy, tokens, tokens);
-                // The route frontier is the parent's: A8 from T=8 when the policy permits it.
-                const bool a8 = policy != ops::LinearPolicy::A16Only && tokens >= 8;
+                // The route frontier is the parent's: A8 from T=17 when the policy permits it.
+                const bool a8 = policy != ops::LinearPolicy::A16Only && tokens >= 17;
                 if ((bytes != 0) != a8) { throw std::runtime_error("unexpected A8 workspace"); }
             });
         }
@@ -1125,8 +1125,10 @@ int main() {
     if (failures == 0) {
         failures += verify_split_rejections(ec, weights);
         // Decode, the SIMT and bounded-MMA frontiers, the A8 threshold and the GEMM schedules.
+        // 200 and 820 land in the shard's split-K bands (T=193..256 and T=769..896), where the
+        // parent does not split, so they exercise the shard's split-K partials.
         failures += run_input_case(
-            ec, weights, 45U, {1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 64, 65, 97, 128, 300},
+            ec, weights, 45U, {1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 64, 65, 97, 128, 200, 300, 820},
             {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4});
         // The conv forms take A8 from W=10 at B=1 and from B*W=9 when batched, not from T=8 as the
         // bare projection does; W=8..10 and B*W=8..9 straddle both frontiers.

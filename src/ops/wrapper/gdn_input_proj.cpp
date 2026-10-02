@@ -1106,9 +1106,11 @@ std::size_t conv_shard_projection_bytes(QType qtype, LinearPolicy policy, std::i
     // The quantization frontier is monotonic in W, so the widest block bounds the interval.
     const std::int32_t columns = batch_size * max_width;
     if (!conv_shard_quantizes(qtype, policy, {max_width, batch_size, columns})) { return 0; }
-    return qtype == QType::NVFP4
-               ? detail::nvfp4_a4_workspace_capacity_bytes(columns, kShardHidden)
-               : detail::fp8_a8_workspace_capacity_bytes(columns, kShardHidden);
+    if (qtype == QType::NVFP4) {
+        return detail::nvfp4_a4_workspace_capacity_bytes(columns, kShardHidden);
+    }
+    return detail::fp8_a8_workspace_capacity_bytes(
+        columns, kShardHidden, detail::fp8_gdn_input_partial_capacity_bytes(columns));
 }
 
 } // namespace

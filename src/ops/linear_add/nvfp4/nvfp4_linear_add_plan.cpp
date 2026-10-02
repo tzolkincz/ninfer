@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -26,7 +27,9 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         input_rows == Nvfp4N5120K17408::kInputRows || input_rows == Nvfp4N5120K8704::kInputRows;
     if (tokens <= 0 || output_rows != Nvfp4N5120K6144::kOutputRows ||
         (!output_family && !down_family)) {
-        throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
+        throw std::invalid_argument(
+            "nvfp4 linear_add: unsupported shape (n=" + std::to_string(output_rows) +
+            ", k=" + std::to_string(input_rows) + ", t=" + std::to_string(tokens) + ")");
     }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         return Nvfp4LinearAddRoute::A16;

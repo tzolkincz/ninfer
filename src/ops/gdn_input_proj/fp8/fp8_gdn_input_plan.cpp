@@ -90,8 +90,11 @@ void fp8_gdn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor&
 
 void fp8_gdn_input_shard_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope                   = workspace.scope();
-    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
+    auto scope = workspace.scope();
+    // The [8192,5120] shard splits an underfilled final wave from T=193, where the parent does
+    // not, so its split-K partials follow the same capacity as the parent route.
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
+        workspace, x.ne[1], weight.k, fp8_gdn_input_partial_capacity_bytes(x.ne[1]));
     fp8_gdn_input_shard_a8_launch(x, weight, qkv, z, scratch, stream);
 }
 

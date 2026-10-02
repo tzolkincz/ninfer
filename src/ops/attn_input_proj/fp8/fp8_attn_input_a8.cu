@@ -13,7 +13,8 @@ using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4
 } // namespace
 
 std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
-    return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+    // The [7168,5120] shard reaches an underfilled final wave at T=289, before the parent does.
+    return max_tokens > 288 ? Bulk::kPartialBytes : 0;
 }
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,

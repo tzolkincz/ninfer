@@ -117,6 +117,16 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {1152, 4304, 187U, Comparison::Sampled, false, kN1152K4304});
 
+    constexpr std::array kN12288K5120Full{graph(1), graph(2), graph(3), graph(16), graph(64),
+                                          graph(256), graph(1024)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {12288, 5120, 193U, Comparison::Full, true, kN12288K5120Full});
+
+    constexpr std::array kN12288K5120{a16(1), a16(2), a16(3), a16(5), a16(16), a16(128),
+                                      a16(512), a16(2048)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {12288, 5120, 193U, Comparison::Sampled, false, kN12288K5120});
+
     return failures;
 }
 

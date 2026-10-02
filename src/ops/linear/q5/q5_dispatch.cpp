@@ -2,6 +2,7 @@
 #include "ops/linear/q5/q5_shapes.h"
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -14,7 +15,7 @@ constexpr std::array kShapes{
     ShapeEntry{1024, 5120, select_q5_n1024_k5120},   ShapeEntry{6144, 5120, select_q5_n6144_k5120},
     ShapeEntry{7168, 5120, select_q5_n7168_k5120},   ShapeEntry{5120, 6144, select_q5_n5120_k6144},
     ShapeEntry{5120, 17408, select_q5_n5120_k17408}, ShapeEntry{1152, 1152, select_q5_n1152_k1152},
-    ShapeEntry{1152, 4304, select_q5_n1152_k4304},
+    ShapeEntry{1152, 4304, select_q5_n1152_k4304},   ShapeEntry{12288, 5120, select_q5_n12288_k5120},
 };
 } // namespace
 
@@ -23,7 +24,9 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q5 linear: unsupported shape");
+    throw std::invalid_argument(
+        "q5 linear: unsupported shape (n=" + std::to_string(n) + ", k=" + std::to_string(k) +
+        ", t=" + std::to_string(t) + ")");
 }
 
 Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
