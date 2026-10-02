@@ -13,6 +13,8 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/k16v4/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/k16v4/launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -37,11 +39,12 @@ void require_causal_geometry(AttentionHeadGeometry geometry, KvCacheStorage stor
           (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
-    // The 12/2 two-device half is instantiated by the BF16 and INT8 cache kernels only.
+    // The 12/2 two-device half is instantiated by the BF16, INT8, and K8V4 cache kernels.
     if (geometry.query_heads == 12 && storage != KvCacheStorage::BFloat16 &&
-        storage != KvCacheStorage::Int8Group64) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": head geometry 12/2 requires a BF16 or INT8 cache");
+        storage != KvCacheStorage::Int8Group64 &&
+        storage != KvCacheStorage::Fp8KeyNvfp4Value) {
+        throw std::invalid_argument(
+            std::string(op) + ": head geometry 12/2 requires a BF16, INT8, or K8V4 cache");
     }
 }
 
@@ -301,6 +304,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width,
                                                 envelope);
 
+    if (cache_storage == KvCacheStorage::Bf16KeyNvfp4Value)
+        return detail::k16v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width,
+                                               envelope);
+
     return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope);
 }
 
@@ -348,6 +355,12 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
+    if (cache.storage == KvCacheStorage::Bf16KeyNvfp4Value) {
+        detail::k16v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                          cache, envelope, workspace, out, stream);
+        return;
+    }
+
     detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                      envelope, workspace, out, stream);
 }
@@ -380,6 +393,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::nvfp4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                          stream);
+        return;
+    }
+
+    if (cache.storage == KvCacheStorage::Bf16KeyNvfp4Value) {
+        detail::k16v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                           stream);
         return;
     }

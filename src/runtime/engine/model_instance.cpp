@@ -91,8 +91,10 @@ void validate_options(const EngineOptions& options) {
                 "Engine tp 2 DFlash2 requires the optimized proposal head (--lm-head-draft)");
         }
         if (options.kv_cache != KvCacheStorage::BFloat16 &&
-            options.kv_cache != KvCacheStorage::Int8Group64) {
-            throw std::invalid_argument("Engine tp 2 supports only bf16 and int8 KV caches");
+            options.kv_cache != KvCacheStorage::Int8Group64 &&
+            options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value) {
+            throw std::invalid_argument(
+                "Engine tp 2 supports only bf16, int8, and k8v4 KV caches");
         }
         if (options.context_cache.host_state_slots != 0 ||
             options.context_cache.host_kv_capacity_bytes != 0) {

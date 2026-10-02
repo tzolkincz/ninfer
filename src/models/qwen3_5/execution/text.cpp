@@ -1494,9 +1494,10 @@ void TextContext::validate_tensor_parallel() {
             // The head-local [256,12,2] attention geometry is registered for these two caches
             // only (softmax_attention.h).
             if (view.storage != KvCacheStorage::BFloat16 &&
-                view.storage != KvCacheStorage::Int8Group64) {
+                view.storage != KvCacheStorage::Int8Group64 &&
+                view.storage != KvCacheStorage::Fp8KeyNvfp4Value) {
                 throw std::invalid_argument(
-                    "tensor-parallel attention supports only BF16 and INT8-G64 KV caches");
+                    "tensor-parallel attention supports only BF16, INT8-G64, and k8v4 KV caches");
             }
             if (view.num_kv_heads != dimension(shard_config_->attention->num_key_value_heads) ||
                 view.head_dim != dimension(shard_config_->attention->head_dim)) {
@@ -1525,9 +1526,10 @@ void TextContext::validate_tensor_parallel_mtp() {
         }
         const PagedKVBatchLayerView view = rank_mtp_cache(rank).batch_layer_view(0);
         if (view.storage != KvCacheStorage::BFloat16 &&
-            view.storage != KvCacheStorage::Int8Group64) {
+            view.storage != KvCacheStorage::Int8Group64 &&
+            view.storage != KvCacheStorage::Fp8KeyNvfp4Value) {
             throw std::invalid_argument(
-                "tensor-parallel MTP attention supports only BF16 and INT8-G64 KV caches");
+                "tensor-parallel MTP attention supports only BF16, INT8-G64, and k8v4 KV caches");
         }
         if (view.num_kv_heads != dimension(shard_config_->attention->num_key_value_heads) ||
             view.head_dim != dimension(shard_config_->attention->head_dim)) {
