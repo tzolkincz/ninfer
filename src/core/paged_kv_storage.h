@@ -87,6 +87,14 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    case KvCacheStorage::Bf16KeyNvfp4Value:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::BF16, head_dim, DType::U8, 0},
+                    {DType::U8, 128, DType::U8, 16}};
+        }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

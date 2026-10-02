@@ -67,6 +67,9 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return {{DType::FP8_E4M3FN, kFullHeadDim, DType::FP16, kFullFp8Groups},
                 {DType::U8, kFullNvfp4CodeBytes, DType::U8, kFullNvfp4Groups}};
+    case KvCacheStorage::Bf16KeyNvfp4Value:
+        return {{DType::BF16, kFullHeadDim, DType::U8, 0},
+                {DType::U8, kFullNvfp4CodeBytes, DType::U8, kFullNvfp4Groups}};
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -436,6 +439,13 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
             host_k[full_input_index(0, 1, 0, kv_heads)] = 448.0f;
             host_k[full_input_index(1, 1, 0, kv_heads)] = 1.0625f;
         }
+    } else if (storage == KvCacheStorage::Bf16KeyNvfp4Value) {
+        auto codec_vector = nvfp4_codec_rotated_vector();
+        set_public_row_from_rotated(host_v, codec_vector, 0, 0, kv_heads);
+        if (kv_heads > 1) {
+            host_k[full_input_index(0, 1, 0, kv_heads)] = 448.0f;
+            host_k[full_input_index(1, 1, 0, kv_heads)] = 1.0625f;
+        }
     }
     std::vector<std::uint16_t> input_k(input_count);
     std::vector<std::uint16_t> input_v(input_count);
@@ -641,6 +651,51 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                  from_device<std::uint8_t>(scale_v.data(), v_scale_count),
                                  expected_scale_v);
         failures += scale_k.verify_guards((label + " k scale guards").c_str());
+        failures += scale_v.verify_guards((label + " v scale guards").c_str());
+    } else if (storage == KvCacheStorage::Bf16KeyNvfp4Value) {
+        // K: BF16 pass-through (no rotation, no quantization, no scale plane)
+        // V: NVFP4 (Hadamard rotation + group-16 quantization)
+        std::vector<std::uint8_t> expected_v(v_code_count, 0xaaU);
+        std::vector<std::uint8_t> expected_scale_v(v_scale_count, 0x42U);
+        std::vector<std::uint16_t> expected_k_bf16(k_code_count, 0x5555U);
+        cache_k.copy_from_host(expected_k_bf16.data(), expected_k_bf16.size() * sizeof(std::uint16_t));
+        cache_v.copy_from_host(expected_v.data(), expected_v.size());
+        scale_v.copy_from_host(expected_scale_v.data(), expected_scale_v.size());
+        cache.v_scale_pages =
+            Tensor(scale_v.data(), DType::U8, {kFullNvfp4Groups, kPage, kv_heads, physical_pages});
+        for (int token = 0; token < tokens; ++token) {
+            const int position = positions[static_cast<std::size_t>(token)];
+            const int page     = mapping[static_cast<std::size_t>(position / kPage)];
+            for (int head = 0; head < kv_heads; ++head) {
+                for (int d = 0; d < kFullHeadDim; ++d) {
+                    const auto source = full_input_index(d, head, token, kv_heads);
+                    expected_k_bf16[full_cache_index(kFullHeadDim, d, head, position, page, kv_heads)] =
+                        f32_to_bf16(host_k[source]);
+                }
+                // V: raw NVFP4 encoding (no Hadamard rotation)
+                std::array<float, kFullHeadDim> v_row{};
+                for (int d = 0; d < kFullHeadDim; ++d) {
+                    const auto source   = full_input_index(d, head, token, kv_heads);
+                    v_row[static_cast<std::size_t>(d)] = host_v[source];
+                }
+                encode_full_nvfp4_row(v_row, expected_v, head, position, page, kv_heads,
+                                      expected_scale_v);
+            }
+        }
+        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        cuda_synchronize();
+        const std::string label = "kv_cache_append full k16v4 Hkv=" + std::to_string(kv_heads) +
+                                  " T=" + std::to_string(tokens) +
+                                  " P=" + std::to_string(first_position);
+        failures += verify_exact((label + " k bf16").c_str(),
+                                 from_device<std::uint16_t>(cache_k.data(), k_code_count),
+                                 expected_k_bf16);
+        failures +=
+            verify_exact((label + " v codes").c_str(),
+                         from_device<std::uint8_t>(cache_v.data(), v_code_count), expected_v);
+        failures += verify_exact((label + " v scales").c_str(),
+                                 from_device<std::uint8_t>(scale_v.data(), v_scale_count),
+                                 expected_scale_v);
         failures += scale_v.verify_guards((label + " v scale guards").c_str());
     } else {
         std::vector<std::uint8_t> expected_k(k_code_count, 0x55U);
@@ -1396,11 +1451,12 @@ int main(int argc, char** argv) {
         failures += full_append_case(kv_heads, KvCacheStorage::Fp8E4M3Row256);
         failures += full_append_case(kv_heads, KvCacheStorage::Nvfp4Group16);
         failures += full_append_case(kv_heads, KvCacheStorage::Fp8KeyNvfp4Value);
+        failures += full_append_case(kv_heads, KvCacheStorage::Bf16KeyNvfp4Value);
     }
     failures += full_append_case(2, KvCacheStorage::Int8Group64, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8E4M3Row256, 129);
-    failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
+    failures += full_append_case(2, KvCacheStorage::Bf16KeyNvfp4Value, 129);
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);

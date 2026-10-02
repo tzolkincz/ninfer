@@ -56,6 +56,7 @@ inline ReductionCriterion attention_criterion(KvCacheStorage storage) {
     if (storage == KvCacheStorage::Fp8E4M3Row256) return kAttentionFp8Criterion;
     if (storage == KvCacheStorage::Nvfp4Group16) return kAttentionNvfp4Criterion;
     if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kAttentionK8V4Criterion;
+    if (storage == KvCacheStorage::Bf16KeyNvfp4Value) return kAttentionNvfp4Criterion;
     throw std::logic_error("unregistered causal-attention test storage");
 }
 

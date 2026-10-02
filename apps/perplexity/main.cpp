@@ -53,6 +53,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Bf16KeyNvfp4Value:
+        return "k16v4";
     }
     throw std::logic_error("unknown KV dtype");
 }

@@ -120,6 +120,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Bf16KeyNvfp4Value:
+        return "k16v4";
     }
     return "unknown";
 }
