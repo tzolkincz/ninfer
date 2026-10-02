@@ -4,8 +4,10 @@
 
 namespace ninfer::ops::detail {
 
-// RTX 5090 target. Wave budgets remain owned by each dtype plan.
-inline constexpr int kCausalAttentionSmCount = 170;
+// Wave budgets remain owned by each dtype plan. Set to the target GPU's SM count
+// at startup via set_causal_attention_sm_count() (default: 170 for RTX 5090).
+inline int kCausalAttentionSmCount = 170;
+inline void set_causal_attention_sm_count(int count) { kCausalAttentionSmCount = count; }
 
 // Capture reserves partials for the largest live row. Producer and merge use
 // the same live count; a wider capture never changes a row's work partition.

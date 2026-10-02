@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "ops/softmax_attention/common/causal_partition.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +25,11 @@ constexpr SyncSchedule kSyncSchedules[] = {
 
 unsigned int sync_schedule_from_environment() {
     const char* value = std::getenv("NINFER_CUDA_SYNC");
-    if (value == nullptr) { return cudaDeviceScheduleSpin; }
+    // Upstream NInfer #301: spin (and Auto, on a host with more cores than active contexts)
+    // busy-waits a full core on every stream/event synchronization while the GPU is busy.
+    // Default to blocking so the waiting thread sleeps in the driver; select spin, yield, or
+    // auto explicitly with NINFER_CUDA_SYNC.
+    if (value == nullptr) { return cudaDeviceScheduleBlockingSync; }
     for (const auto& schedule : kSyncSchedules) {
         if (schedule.name == value) { return schedule.flags; }
     }
@@ -145,6 +150,10 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     stream          = compute;
     transfer_stream = load;
+    const char* sm_override = std::getenv("NINFER_SM_COUNT");
+    const int sm_count       = sm_override ? std::stoi(sm_override) : props.multiProcessorCount;
+    ninfer::kDeviceSmCount                                    = sm_count;
+    ninfer::ops::detail::set_causal_attention_sm_count(sm_count);
 }
 
 DeviceContext::~DeviceContext() {

@@ -21,6 +21,12 @@ struct DeviceExecutionView {
     std::int32_t multiprocessor_count = 0;
 };
 
+// Runtime SM count set at DeviceContext construction. Used by launchers whose
+// tuning thresholds scale with the physical device (one block per SM, wave
+// capacities, persistent-grid caps). Default 170 (RTX 5090); overridden by
+// NINFER_SM_COUNT env var or the actual device property at startup.
+inline int kDeviceSmCount = 170;
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
