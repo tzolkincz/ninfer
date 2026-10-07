@@ -5,6 +5,10 @@
 > which does not fit one 16 GB board, runs split across two. It builds on earlier TP2 forks by
 > Wael Mansour, natpate, ivanov84 and parallelno; see [NOTICE](NOTICE) for attribution.
 >
+> - **Provenance — AI slop.** Nearly all fork-specific changes in this repo were written by an
+>   AI coding agent (agentic sessions, human-directed). It builds, tests, and measures as
+>   documented, but the code is machine-flavored: expect AI slop and review diffs before
+>   building on it.
 > - **Covered:** ordinary decoding, `--spec mtp`, `--spec dflash2 --lm-head-draft`, prefix
 >   reuse, concurrent requests, CUDA Graph decode and `--vision`, with `bf16` or `int8` KV. See
 >   [Two GPUs](docs/cli.md#two-gpus) and [serving](docs/serving.md).
