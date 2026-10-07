@@ -25,10 +25,13 @@ public:
     explicit Bindings(artifact::Binder& binder) : binder(binder) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
-                                     std::vector<std::string> inputs   = {},
-                                     std::optional<QType> exact_format = {});
+                                     std::vector<std::string> inputs     = {},
+                                     std::optional<QType> exact_format   = {},
+                                     artifact::Residency residency       =
+                                     artifact::Residency::Device);
     [[nodiscard]] WeightId direct(std::string name, artifact::Shape shape,
-                                  QType format = QType::BF16);
+                                  QType format                 = QType::BF16,
+                                  artifact::Residency residency = artifact::Residency::Device);
 
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 

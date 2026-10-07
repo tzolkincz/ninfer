@@ -17,13 +17,14 @@ WeightUseId Bindings::use(WeightId id, std::string_view input) const {
 }
 
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
-                             std::vector<std::string> inputs, std::optional<QType> exact_format) {
+                             std::vector<std::string> inputs, std::optional<QType> exact_format,
+                             artifact::Residency residency) {
     if (parameters_.contains(name)) {
         throw artifact::ArtifactError(name + ": duplicate model parameter declaration");
     }
     PendingWeight pending;
     pending.reference =
-        binder.parameter(name, std::move(shape), artifact::Residency::Device, exact_format);
+        binder.parameter(name, std::move(shape), residency, exact_format);
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -65,8 +66,9 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
     return id;
 }
 
-WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format) {
-    return parameter(std::move(name), std::move(shape), {}, format);
+WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format,
+                          artifact::Residency residency) {
+    return parameter(std::move(name), std::move(shape), {}, format, residency);
 }
 
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
@@ -88,16 +90,30 @@ std::vector<BoundWeight> resolve_weights(std::span<const PendingWeight> pending,
     out.reserve(pending.size());
     for (const auto& item : pending) {
         const auto& reference = item.reference;
-        std::size_t held      = 0;
-        for (const auto& part : reference.binding.parts) {
-            held += materialized.has_device(part.object, device) ? 1 : 0;
-        }
         WeightView view;
-        if (held == reference.binding.parts.size()) {
-            view = artifact::bind_view(reference, materialized, device);
-        } else if (held != 0) {
-            throw artifact::ArtifactError(reference.name + ": device " + std::to_string(device) +
-                                          " holds only some of its parents");
+        if (reference.residency == artifact::Residency::Host) {
+            // A host-resident weight keeps its bytes in shared host memory (no per-rank device
+            // parent) but is visible only on the rank(s) its shard places it, so a SingleDevice
+            // weight (the vision tower) is resident on exactly its rank, not on every rank.
+            std::size_t resident = 0;
+            for (const auto& part : reference.binding.parts) {
+                resident += materialized.host_resident(part.object, device) ? 1 : 0;
+            }
+            if (resident == reference.binding.parts.size()) {
+                view = artifact::bind_view(reference, materialized, device);
+            }
+        } else {
+            std::size_t held = 0;
+            for (const auto& part : reference.binding.parts) {
+                held += materialized.has_device(part.object, device) ? 1 : 0;
+            }
+            if (held == reference.binding.parts.size()) {
+                view = artifact::bind_view(reference, materialized, device);
+            } else if (held != 0) {
+                throw artifact::ArtifactError(
+                    reference.name + ": device " + std::to_string(device) +
+                    " holds only some of its parents");
+            }
         }
         out.push_back({reference.name, item.source_objects, std::move(view), item.uses});
     }

@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace ninfer::artifact {
@@ -35,6 +36,10 @@ struct HostPlacement {
     ObjectHandle object;
     // Already-read resources move into final storage without invalidating their byte views.
     std::vector<std::byte> data;
+    // Device(s) a host-resident weight is visible to (its logical shard). A SingleDevice weight
+    // (the vision tower) names exactly one rank; everything else is visible on every device in
+    // the plan. resolve_weights grants the host view only on these devices.
+    std::array<bool, kMaximumDevices> resident{};
 };
 
 struct MaterializationPlan {
@@ -95,6 +100,7 @@ public:
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle, int device = 0) const noexcept;
+    [[nodiscard]] bool host_resident(ObjectHandle handle, int device) const noexcept;
 
     [[nodiscard]] int device_count() const noexcept { return stats_.device_count; }
 
@@ -113,7 +119,8 @@ private:
     struct ObjectStorage {
         std::array<DeviceStorage, kMaximumDevices> device;
         std::optional<WeightParent> host;
-        std::vector<std::byte> host_data;
+        std::variant<std::monostate, std::vector<std::byte>, PinnedHostBuffer> host_data;
+        std::array<bool, kMaximumDevices> host_resident{};
     };
 
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> arenas_;

@@ -179,15 +179,28 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || objects_[handle.index].host_data.empty()) {
+    if (handle.index >= objects_.size()) {
         throw ArtifactError("object has no retained Host bytes");
     }
-    return objects_[handle.index].host_data;
+    const auto& host_data = objects_[handle.index].host_data;
+    if (const auto* bytes = std::get_if<std::vector<std::byte>>(&host_data)) {
+        return std::span<const std::byte>(bytes->data(), bytes->size());
+    }
+    if (const auto* pinned = std::get_if<PinnedHostBuffer>(&host_data)) {
+        return std::span<const std::byte>(reinterpret_cast<const std::byte*>(pinned->data()),
+                                           pinned->size());
+    }
+    throw ArtifactError("object has no retained Host bytes");
 }
 
 bool MaterializedArtifact::has_device(ObjectHandle handle, int device) const noexcept {
     return device >= 0 && device < stats_.device_count && handle.index < objects_.size() &&
            objects_[handle.index].device[static_cast<std::size_t>(device)].parent.has_value();
+}
+
+bool MaterializedArtifact::host_resident(ObjectHandle handle, int device) const noexcept {
+    return device >= 0 && device < stats_.device_count && handle.index < objects_.size() &&
+           objects_[handle.index].host_resident.at(device);
 }
 
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
@@ -260,7 +273,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
-        if (!storage.host_data.empty()) { throw ArtifactError("duplicate Host placement"); }
+        if (!std::holds_alternative<std::monostate>(storage.host_data)) {
+            throw ArtifactError("duplicate Host placement");
+        }
+        storage.host_resident = placement.resident;
         const auto& object = reader.directory().object(placement.object);
         if (placement.data.empty()) {
             placement.data = reader.read_object(placement.object);
@@ -270,14 +286,29 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (placement.data.size() != object_bytes(object)) {
             throw ArtifactError("Host placement size differs from object");
         }
-        storage.host_data = std::move(placement.data);
         out.stats_.retained_host_bytes =
-            checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
+            checked_add(out.stats_.retained_host_bytes, placement.data.size(), "retained bytes");
+        if (std::holds_alternative<ResourceObject>(object)) {
+            // Resources move their already-read buffer into final storage verbatim, keeping the
+            // binding-time byte views (tokenizer, templates, configs) valid for the process.
+            storage.host_data = std::move(placement.data);
+        } else if (!placement.data.empty()) {
+            // Retain the backing pinned (device-mappable) so a Residency::Host weight is read
+            // directly by device kernels over the interconnect instead of occupying VRAM.
+            PinnedHostBuffer pinned(placement.data.size());
+            std::copy(placement.data.begin(), placement.data.end(),
+                      reinterpret_cast<std::byte*>(pinned.data()));
+            storage.host_data = std::move(pinned);
+        }
         if (std::holds_alternative<TensorObject>(object)) {
-            const auto& geometry = reader.geometry(placement.object);
-            const auto divisor =
-                read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
+            if (const auto* pinned = std::get_if<PinnedHostBuffer>(&storage.host_data)) {
+                const auto& geometry = reader.geometry(placement.object);
+                const auto* backing  = reinterpret_cast<const std::byte*>(pinned->data());
+                const auto divisor   = read_divisor(reader, placement.object, geometry,
+                                                   std::span<const std::byte>{backing, pinned->size()},
+                                                   out.stats_);
+                storage.host = WeightParent{geometry, backing, divisor};
+            }
         }
     }
     std::vector<CopyRange> ranges;

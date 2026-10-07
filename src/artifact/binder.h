@@ -68,6 +68,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool weight             = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;
     };

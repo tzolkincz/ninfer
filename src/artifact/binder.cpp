@@ -61,6 +61,7 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             throw ArtifactError(name +
                                 ": representation does not match its mathematical value type");
         }
+        demands_.at(part.object.index).weight = true;
         if (residency == Residency::Device) {
             require_device(part.object);
         } else if (residency == Residency::Host) {
@@ -225,7 +226,28 @@ MaterializationPlan Binder::finish() && {
         auto& demand = demands_[i];
         if (demand.device) { place_device(plan, ObjectHandle{i}, demand.alignment); }
         if (demand.host) {
-            plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
+            HostPlacement placement{.object = ObjectHandle{i}, .data = std::move(demand.host_data)};
+            if (demand.weight && shard_resolver_) {
+                // A host-resident weight is visible only on the device(s) its logical shard names
+                // (SingleDevice for the vision tower); otherwise every device in the plan.
+                const auto& rule =
+                    shard_resolver_(ObjectHandle{i}, reader_.geometry(ObjectHandle{i}));
+                if (rule.axis == ShardAxis::SingleDevice) {
+                    placement.resident[static_cast<std::size_t>(rule.device)] = true;
+                } else if (rule.axis == ShardAxis::PrimaryOnly) {
+                    placement.resident[0] = true;
+                } else {
+                    for (int device = 0; device < device_count_; ++device) {
+                        placement.resident[device] = true;
+                    }
+                }
+            } else {
+                // Resources and single-device plans stay visible on every device in the plan.
+                for (int device = 0; device < device_count_; ++device) {
+                    placement.resident[device] = true;
+                }
+            }
+            plan.host_objects.push_back(std::move(placement));
         }
     }
     for (const auto capacity : plan.per_device_capacity_bytes) {
