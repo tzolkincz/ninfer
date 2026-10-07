@@ -538,6 +538,52 @@ int main() {
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
 
+    {
+        const std::string raw_path = "raw-turns-contract.jsonl";
+        std::filesystem::remove(raw_path);
+        std::filesystem::remove(raw_path + ".raw-turns.jsonl");
+        {
+            JsonlRequestLog raw_log(raw_path);
+            RequestLogContext raw_context = context;
+            raw_context.tool_count        = 4;
+            GenerationOutcome raw_failed  = fallback_outcome;
+            raw_failed.reasoning          = "raw reasoning";
+            raw_failed.text               = "raw content";
+            raw_log.write_request_done(raw_context, raw_failed);
+            GenerationOutcome raw_ok = normalized_tool_outcome;
+            raw_ok.reasoning         = "ok reasoning";
+            raw_ok.text               = "ok content";
+            raw_log.write_request_done(raw_context, raw_ok);
+            RequestLogContext prose_context = context;
+            prose_context.tool_count        = 0;
+            raw_log.write_request_done(prose_context, raw_failed);
+        }
+        std::ifstream raw_sidecar(raw_path + ".raw-turns.jsonl");
+        std::vector<Json> raw_records;
+        std::string raw_line;
+        while (std::getline(raw_sidecar, raw_line)) {
+            if (!raw_line.empty()) { raw_records.push_back(Json::parse(raw_line)); }
+        }
+        failures += check(raw_records.size() == 1 &&
+                              raw_records.front().at("event") == "raw_turn" &&
+                              raw_records.front().at("request").at("tool_count") == 4 &&
+                              raw_records.front().at("reasoning") == "raw reasoning" &&
+                              raw_records.front().at("content") == "raw content" &&
+                              raw_records.front().at("result")
+                                  .at("tool_call_parse")
+                                  .at("fallback_reason") == "duplicate_parameter",
+                          "failed tool turn did not publish its raw channels to the sidecar");
+        std::ifstream raw_main(raw_path);
+        std::size_t raw_done_count = 0;
+        while (std::getline(raw_main, raw_line)) {
+            if (raw_line.find("\"event\":\"request_done\"") != std::string::npos) { ++raw_done_count; }
+        }
+        failures += check(raw_done_count == 3,
+                          "raw-turn sidecar altered the main request log record count");
+    }
+    std::filesystem::remove("raw-turns-contract.jsonl");
+    std::filesystem::remove("raw-turns-contract.jsonl.raw-turns.jsonl");
+
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
