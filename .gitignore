@@ -9,6 +9,7 @@ cmake-build-*/
 compile_commands.json
 CMakeUserPresets.json
 .cache/
+bench_kernels
 
 # CUDA / profiling artifacts
 *.nsys-rep

@@ -1,0 +1,50 @@
+diff --git a/docs/cli.md b/docs/cli.md
+index d9d7d23..803e2a3 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -260,10 +260,11 @@ Run `./build/apps/ninfer --help` for the exact option contract.
+ ## CUDA synchronization
+ 
+ `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI
+-and HTTP server. When unset, it defaults to `spin`, prioritizing low synchronization latency at
+-the cost of CPU usage while waiting for the GPU. Use `blocking` to let the waiting thread sleep;
+-the decode performance cost depends on the host. `yield` yields the CPU while waiting, and `auto`
+-uses CUDA's scheduling heuristic, not an automatic performance benchmark.
++and HTTP server. When unset, it defaults to `blocking`, which lets the waiting thread sleep in
++the driver instead of holding a core at 100% while the GPU is busy (upstream NInfer #301); the
++decode performance cost depends on the host. Use `spin` to prioritize low synchronization
++latency at the cost of CPU usage, `yield` to yield the CPU while waiting, and `auto` to let CUDA
++choose by heuristic rather than an automatic performance benchmark.
+ 
+ ```bash
+ NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
+diff --git a/src/core/device.cu b/src/core/device.cu
+index a9ad072..b68de64 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -24,7 +24,11 @@ constexpr SyncSchedule kSyncSchedules[] = {
+ 
+ unsigned int sync_schedule_from_environment() {
+     const char* value = std::getenv("NINFER_CUDA_SYNC");
+-    if (value == nullptr) { return cudaDeviceScheduleSpin; }
++    // Upstream NInfer #301: spin (and Auto, on a host with more cores than active contexts)
++    // busy-waits a full core on every stream/event synchronization while the GPU is busy.
++    // Default to blocking so the waiting thread sleeps in the driver; select spin, yield, or
++    // auto explicitly with NINFER_CUDA_SYNC.
++    if (value == nullptr) { return cudaDeviceScheduleBlockingSync; }
+     for (const auto& schedule : kSyncSchedules) {
+         if (schedule.name == value) { return schedule.flags; }
+     }
+diff --git a/tests/test_device.cpp b/tests/test_device.cpp
+index bb1450b..7bebe8a 100644
+--- a/tests/test_device.cpp
++++ b/tests/test_device.cpp
+@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
+         return fail("invalid sync setting did not fail before CUDA initialization");
+     }
+     const unsigned int expected_flags =
+-        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleSpin;
++        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleBlockingSync;
+     int count                   = 0;
+     const cudaError_t count_err = cudaGetDeviceCount(&count);
+     if (cuda_unavailable(count_err)) {
