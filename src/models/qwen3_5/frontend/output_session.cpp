@@ -15,6 +15,7 @@ namespace ninfer::models::qwen3_5 {
 namespace {
 namespace fi                                = frontend;
 constexpr std::string_view kThinkClose      = "</think>";
+constexpr std::string_view kToolOpen        = "<tool_call>";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
 std::size_t channel_index(OutputChannel channel) noexcept {
@@ -101,6 +102,53 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
+constexpr bool is_close_separator(char byte) noexcept {
+    return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
+}
+
+bool is_format_whitespace_only(std::string_view text) noexcept {
+    for (const char byte : text) {
+        if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n') { return false; }
+    }
+    return true;
+}
+
+struct ReasoningCloseScan {
+    std::size_t close = std::string::npos;
+    std::size_t hold  = 0;
+};
+
+// Generated prose can quote the close marker while discussing the protocol, so a marker counts as
+// the reasoning close only when it is followed by format whitespace, by the tool-call opener, or
+// by the implicit end of the turn. A marker inside quoted text is followed by punctuation or an
+// escaped newline and stays in the reasoning channel. Markers at the end of the available bytes
+// stay pending until their following byte arrives, which keeps a quoted marker from closing the
+// channel across a token round. The tool opener counts as a boundary because the grammar places
+// a tool call immediately after the close marker, so models routinely emit
+// "</think><tool_call>" without intervening whitespace; holding for whitespace that never comes
+// would swallow the entire call into the reasoning channel, where the tool decoder never sees
+// it. A marker followed by a partially buffered opener stays pending until the opener resolves.
+ReasoningCloseScan scan_reasoning_close(std::string_view text, bool implicit_end) {
+    std::size_t search = 0;
+    for (;;) {
+        const std::size_t marker = text.find(kThinkClose, search);
+        if (marker == std::string_view::npos) { break; }
+        const std::size_t after = marker + kThinkClose.size();
+        if (after == text.size()) {
+            if (implicit_end) { return ReasoningCloseScan{.close = marker}; }
+            return ReasoningCloseScan{.hold = text.size() - marker};
+        }
+        if (is_close_separator(text[after])) { return ReasoningCloseScan{.close = marker}; }
+        const std::string_view rest = text.substr(after);
+        if (rest == kToolOpen) { return ReasoningCloseScan{.close = marker}; }
+        if (rest.size() < kToolOpen.size() && kToolOpen.starts_with(rest)) {
+            return ReasoningCloseScan{.hold = text.size() - marker};
+        }
+        search = after;
+    }
+    return ReasoningCloseScan{.hold = longest_suffix_prefix(text, kThinkClose, true)};
+}
+
 template <std::size_t Size>
 consteval std::array<std::size_t, Size> make_prefix_failure_table(std::string_view pattern) {
     std::array<std::size_t, Size> failure{};
@@ -139,15 +187,18 @@ struct PrefixExecutionTracker {
 };
 
 struct DecoderState {
+    bool in_reasoning                  = false;
     std::string utf8_pending;
     std::string think_marker_pending;
-    std::array<std::string, 2> stop_pending;
-    bool in_reasoning              = false;
+    std::array<std::string, 2> stop_pending{};
     bool strip_content_leading     = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
     std::optional<std::uint32_t> matched_stop_order;
+    // While set, an engine-injected control span publishes to this channel without re-opening
+    // the reasoning state; the decoder state itself is left for the surrounding model output.
+    std::optional<OutputChannel> forced_channel;
 };
 
 struct SemanticThinkingState {
@@ -157,20 +208,22 @@ struct SemanticThinkingState {
     std::uint32_t injected_tokens       = 0;
     bool in_reasoning                   = false;
     bool control_pending                = false;
+    bool retry_pending                  = false;
+    bool retry_attempted                = false;
     bool applied                        = false;
 };
 
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
     state.close_pending.append(bytes);
-    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+    const ReasoningCloseScan scan = scan_reasoning_close(state.close_pending, false);
+    if (scan.close != std::string::npos) {
         state.close_pending.clear();
         state.in_reasoning    = false;
         state.control_pending = false;
         return;
     }
-    const std::size_t hold = longest_suffix_prefix(state.close_pending, kThinkClose, true);
-    state.close_pending.erase(0, state.close_pending.size() - hold);
+    state.close_pending.erase(0, state.close_pending.size() - scan.hold);
 }
 
 struct StopMatch {
@@ -259,19 +312,24 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
+    if (state.forced_channel.has_value()) {
+        feed_channel(state, *state.forced_channel, text, policy, emitted, committed_tokens,
+                     best_match);
+        return;
+    }
     if (!state.in_reasoning) {
         feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
         return;
     }
 
     state.think_marker_pending.append(text);
-    const std::size_t marker = state.think_marker_pending.find(kThinkClose);
-    if (marker != std::string::npos) {
+    const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, false);
+    if (scan.close != std::string::npos) {
         feed_channel(state, OutputChannel::Reasoning,
-                     std::string_view(state.think_marker_pending).substr(0, marker), policy,
+                     std::string_view(state.think_marker_pending).substr(0, scan.close), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
+        std::string content = state.think_marker_pending.substr(scan.close + kThinkClose.size());
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
         state.strip_content_leading = true;
@@ -279,8 +337,7 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
-    const std::size_t safe = state.think_marker_pending.size() - hold;
+    const std::size_t safe = state.think_marker_pending.size() - scan.hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
                  committed_tokens, best_match);
@@ -305,13 +362,26 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         feed_decoded_text(state, kUtf8Replacement, policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
-        feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
+        // A close marker still pending at the end of the turn is the model's implicit close.
+        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true);
+        const std::size_t split =
+            scan.close != std::string::npos ? scan.close : state.think_marker_pending.size();
+        feed_channel(state, OutputChannel::Reasoning,
+                     std::string_view(state.think_marker_pending).substr(0, split), policy, emitted,
                      committed_tokens, nullptr);
-        state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
-    } else {
-        close_channel(state, OutputChannel::Content, emitted);
+        if (scan.close != std::string::npos) {
+            std::string content =
+                state.think_marker_pending.substr(scan.close + kThinkClose.size());
+            state.think_marker_pending.clear();
+            state.in_reasoning          = false;
+            state.strip_content_leading = true;
+            feed_content(state, std::move(content), policy, emitted, committed_tokens, nullptr);
+        } else {
+            state.think_marker_pending.clear();
+        }
     }
+    close_channel(state, OutputChannel::Content, emitted);
     state.stop_pending = {};
     state.terminal     = true;
 }
@@ -331,11 +401,15 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
+         std::shared_ptr<const std::vector<TokenId>> retry_control_tokens_,
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
+          retry_control_tokens(std::move(retry_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
+          tool_call_contract(output.raw ? nullptr : tool_call_output_),
+          tool_name_max_length(output.tool_name_max_length),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
@@ -351,9 +425,76 @@ public:
         semantic.in_reasoning = starts_in_reasoning;
     }
 
+    // A thinking model can narrate a complete call inside its reasoning channel and close
+    // thinking without emitting it in content. The presentation decoder only parses the content
+    // channel, so such a turn ends with no structured call even though the model intended one.
+    // When the content channel is empty or whitespace-only and the reasoning channel ends with a
+    // well-formed call suffix, promote that suffix to a structured call. parse_qwen_tool_call_output
+    // already refuses a call that is followed by further text, so only a terminal, well-formed
+    // region is ever salvaged.
+    void salvage_reasoning_tool_call() {
+        if (!tool_calls.empty() || tool_call_contract == nullptr || reasoning_text.empty() ||
+            !is_format_whitespace_only(content_text)) {
+            return;
+        }
+        const fi::ParsedToolCallOutput parsed =
+            fi::parse_qwen_tool_call_output(reasoning_text, tool_name_max_length,
+                                            *tool_call_contract);
+        if (!parsed.is_tool_call_response || parsed.tool_calls.empty()) { return; }
+        tool_calls                           = std::move(parsed.tool_calls);
+        tool_call_parse                      = parsed.diagnostics;
+        tool_call_parse.salvaged_from_reasoning = true;
+    }
+
+    // A turn that ends on its own stop token without a message - whitespace-only content, no
+    // tool call, and no reasoning-narrated call to salvage - is a silent response. The
+    // configured message is re-injected once, as a forced control span, only when the thinking
+    // budget is set and the model has actually exhausted it: that is the loop signature
+    // (the model spent its licensed thinking and still produced nothing). A silent stop with
+    // headroom left, or without any budget, ends the turn normally, so mid-tool-loop stops are
+    // never hijacked. One attempt per request.
+    bool arm_empty_turn_retry(std::uint32_t remaining_after_round) {
+        if (retry_control_tokens == nullptr || preview_semantic.retry_attempted) { return false; }
+        if (!preview_semantic.budget ||
+            preview_semantic.model_thinking_tokens < *preview_semantic.budget) {
+            return false;
+        }
+        const std::shared_ptr<const std::vector<TokenId>>& span = preview_semantic.in_reasoning
+                                                                      ? thinking_control_tokens
+                                                                      : retry_control_tokens;
+        if (span == nullptr || span->size() > remaining_after_round) { return false; }
+        std::string all_content = content_text;
+        for (const OutputDelta& delta : preview_output) {
+            if (delta.channel == OutputChannel::Content) { all_content += delta.text; }
+        }
+        if (!is_format_whitespace_only(all_content) || !tool_calls.empty() ||
+            reasoning_salvage_would_apply()) {
+            return false;
+        }
+        preview_semantic.retry_pending = true;
+        return true;
+    }
+
+    // The terminal reasoning-tool-call salvage would find a structured call on the
+    // committed-plus-preview reasoning text. Such a turn ends with a message via that salvage,
+    // so it must not be retried.
+    bool reasoning_salvage_would_apply() const {
+        if (tool_call_contract == nullptr) { return false; }
+        std::string all_reasoning = reasoning_text;
+        for (const OutputDelta& delta : preview_output) {
+            if (delta.channel == OutputChannel::Reasoning) { all_reasoning += delta.text; }
+        }
+        if (all_reasoning.empty()) { return false; }
+        const fi::ParsedToolCallOutput parsed =
+            fi::parse_qwen_tool_call_output(all_reasoning, tool_name_max_length,
+                                            *tool_call_contract);
+        return parsed.is_tool_call_response && !parsed.tool_calls.empty();
+    }
+
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    std::shared_ptr<const std::vector<TokenId>> retry_control_tokens;
     bool preserve_special = false;
     bool split_reasoning  = false;
     DecoderState state;
@@ -364,9 +505,13 @@ public:
     PrefixExecutionTracker preview_prefix_execution;
     std::optional<std::uint32_t> preview_execution_split_after;
     PublishedOutput preview_output;
+    std::shared_ptr<const fi::ToolCallOutputContract> tool_call_contract;
+    std::size_t tool_name_max_length = 0;
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
+    std::string reasoning_text;
+    std::string content_text;
     bool preview_ready = false;
 };
 
@@ -402,10 +547,12 @@ OutputSession::OutputSession(
     std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy, OutputOptions output,
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
+    std::shared_ptr<const std::vector<TokenId>> retry_control_tokens,
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output)
     : impl_(std::make_unique<Impl>(
           std::move(tokenizer), std::move(policy), output, starts_in_reasoning, thinking,
-          std::move(thinking_control_tokens), std::move(tool_call_output))) {}
+          std::move(thinking_control_tokens), std::move(retry_control_tokens),
+          std::move(tool_call_output))) {}
 
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
                                                      std::uint32_t total_budget_remaining,
@@ -413,7 +560,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
-    if (impl_->semantic.control_pending) {
+    if (impl_->semantic.control_pending || impl_->semantic.retry_pending) {
         throw std::logic_error("model output cannot advance while thinking control is pending");
     }
     if (tokens.empty()) {
@@ -497,6 +644,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
             }
+            if (impl_->arm_empty_turn_retry(total_budget_remaining - count)) {
+                return complete(count, FinishReason::None,
+                                runtime::ContinuationAction::ApplyTargetControl);
+            }
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
             return complete(count, FinishReason::StopToken);
         }
@@ -530,18 +681,29 @@ OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining
 }
 
 std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept {
-    if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
-        return {};
+    if (impl_ == nullptr) { return {}; }
+    if (impl_->semantic.control_pending) {
+        return impl_->thinking_control_tokens ? *impl_->thinking_control_tokens
+                                              : std::span<const TokenId>{};
     }
-    return *impl_->thinking_control_tokens;
+    if (impl_->semantic.retry_pending) {
+        const std::shared_ptr<const std::vector<TokenId>>& span =
+            impl_->semantic.in_reasoning ? impl_->thinking_control_tokens
+                                         : impl_->retry_control_tokens;
+        return span ? *span : std::span<const TokenId>{};
+    }
+    return {};
 }
 
 std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
-    if (impl_ == nullptr || !impl_->thinking_control_tokens || !impl_->semantic.budget ||
-        impl_->semantic.applied) {
-        return 0;
-    }
-    return impl_->semantic.control_pending || impl_->semantic.in_reasoning
+    if (impl_ == nullptr || !impl_->thinking_control_tokens) { return 0; }
+    const SemanticThinkingState& s = impl_->semantic;
+    const bool cutoff_armed = s.budget.has_value() && (s.control_pending || s.in_reasoning);
+    // The retry can only arm once the thinking budget is exhausted, so its reservation only has
+    // to persist from exhaustion until the one retry is spent (any other path ends the request).
+    const bool retry_armed = impl_->retry_control_tokens != nullptr && s.budget.has_value() &&
+                             s.model_thinking_tokens >= *s.budget && !s.retry_attempted;
+    return (cutoff_armed || retry_armed)
                ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
                : 0U;
 }
@@ -565,6 +727,11 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
+    const bool empty_turn_retry = impl_->preview_semantic.retry_pending;
+    // A retry span following a naturally closed (or never opened) thinking phase has no close
+    // marker of its own; publish it in the reasoning channel without re-opening the state.
+    const bool forced_reasoning = empty_turn_retry && !impl_->preview_state.in_reasoning;
+    if (forced_reasoning) { impl_->preview_state.forced_channel = OutputChannel::Reasoning; }
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
@@ -572,12 +739,20 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
             boundary && *boundary == decoded.bytes.size()) {
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
         }
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_state.in_reasoning || forced_reasoning) {
+            ++impl_->preview_state.reasoning_tokens;
+        }
         feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         const std::string_view presentation_bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+    }
+    if (forced_reasoning) {
+        impl_->preview_state.forced_channel = std::nullopt;
+        if (!impl_->preview_state.utf8_pending.empty()) {
+            throw std::logic_error("injected retry span did not end on a UTF-8 boundary");
+        }
     }
     if (impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");
@@ -586,8 +761,13 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
     impl_->preview_semantic.control_pending = false;
-    impl_->preview_semantic.applied         = true;
-    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_semantic.retry_pending   = false;
+    if (empty_turn_retry) {
+        impl_->preview_semantic.retry_attempted = true;
+    } else {
+        impl_->preview_semantic.applied = true;
+    }
+    impl_->preview_semantic.injected_tokens += static_cast<std::uint32_t>(tokens.size());
     impl_->preview_ready                    = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
@@ -625,6 +805,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_semantic.control_pending = false;
+    impl_->preview_semantic.retry_pending   = false;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
@@ -663,6 +844,19 @@ PublishedOutput OutputSession::commit_preview() {
             }
         }
     }
+
+    // Accumulate the full published text of each channel so the terminal salvage can consider
+    // the whole turn, not just the final commit.
+    for (const OutputDelta& delta : output) {
+        if (delta.channel == OutputChannel::Reasoning) {
+            impl_->reasoning_text += delta.text;
+        } else {
+            impl_->content_text += delta.text;
+        }
+    }
+    if (impl_->state.terminal) {
+        impl_->salvage_reasoning_tool_call();
+    }
     return output;
 }
 
@@ -685,6 +879,7 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
         .injected_tokens       = impl_->semantic.injected_tokens,
         .applied               = impl_->semantic.applied,
+        .empty_turn_retry      = impl_->semantic.retry_attempted,
     };
 }
 

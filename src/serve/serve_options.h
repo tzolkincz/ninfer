@@ -81,6 +81,11 @@ struct ServeOptions {
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
+    // --reasoning-budget-message MESSAGE: replaces the canonical early-close guidance injected
+    // when the thinking budget exhausts a thinking turn, and is re-injected once in-stream when
+    // a turn ends on its own stop token without a message after the thinking budget has been
+    // exhausted; empty keeps the canonical guidance and disables the empty-turn retry.
+    std::string reasoning_budget_message;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

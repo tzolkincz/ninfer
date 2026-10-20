@@ -127,6 +127,18 @@ constexpr ninfer::TokenId kByte98Token = fixture_byte_token(0x98);
 constexpr ninfer::TokenId kByteC2Token = fixture_byte_token(0xc2);
 constexpr ninfer::TokenId kByteA2Token = fixture_byte_token(0xa2);
 
+// The fixture's added token for the literal reasoning close marker.
+constexpr ninfer::TokenId kFixtureThinkCloseToken = 248069;
+
+std::vector<ninfer::TokenId> fixture_tokens(std::string_view text) {
+    std::vector<ninfer::TokenId> tokens;
+    tokens.reserve(text.size());
+    for (const char byte : text) {
+        tokens.push_back(fixture_byte_token(static_cast<std::uint8_t>(byte)));
+    }
+    return tokens;
+}
+
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
@@ -1720,6 +1732,234 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
+int test_reasoning_close_requires_boundary(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> quoted = fixture_tokens("discussing ");
+    quoted.push_back(kFixtureThinkCloseToken);
+    const auto quoted_decision =
+        session.preview_model(quoted, 64, ninfer::FinishReason::OutputLimit);
+    const auto quoted_output = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(quoted_decision.accepted_tokens == quoted.size() && !quoted_decision.finished(),
+              "a close candidate at a round boundary ended its round early");
+    failures +=
+        check(channel_text(quoted_output, ninfer::OutputChannel::Reasoning) == "discussing " &&
+                  channel_text(quoted_output, ninfer::OutputChannel::Content).empty(),
+              "a close candidate at a round boundary was not held for its following byte");
+
+    const auto quoted_tail = fixture_tokens("'; then hidden\n");
+    const auto tail_decision =
+        session.preview_model(quoted_tail, 64, ninfer::FinishReason::OutputLimit);
+    const auto tail_output = session.commit_preview();
+    failures += check(channel_text(tail_output, ninfer::OutputChannel::Reasoning) ==
+                              "</think>'; then hidden\n" &&
+                          channel_text(tail_output, ninfer::OutputChannel::Content).empty(),
+                      "a marker followed by a quote was treated as a reasoning close");
+
+    std::vector<ninfer::TokenId> close = {kFixtureThinkCloseToken};
+    const auto answer                  = fixture_tokens("\n\nreal answer");
+    close.insert(close.end(), answer.begin(), answer.end());
+    const auto close_decision = session.preview_model(close, 64, ninfer::FinishReason::OutputLimit);
+    const auto close_output   = session.commit_preview();
+    failures +=
+        check(channel_text(close_output, ninfer::OutputChannel::Reasoning).empty() &&
+                  channel_text(close_output, ninfer::OutputChannel::Content) == "real answer",
+              "the real close did not open the content channel");
+    return failures;
+}
+
+int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> tokens = fixture_tokens("done thinking");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures += check(decision.accepted_tokens == tokens.size() &&
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "the implicit terminal close changed the round decision");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "done thinking" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "the implicit terminal close was published into reasoning");
+    return failures;
+}
+
+int test_tool_call_after_boundaryless_think_close(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"},"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["taskId"]}}})");
+    auto prompt  = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string generated =
+        "thought</think><tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                "boundaryless tool region did not reach the terminal transaction");
+    const auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+                      "reasoning channel did not retain only the thinking body");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "content channel did not hide the boundaryless tool-call region");
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
+                      "frontend did not recover the tool call immediately after the think close");
+    return failures;
+}
+
+int test_reasoning_tool_salvage(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}},"required":["taskId"]}}})");
+    auto prompt  = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    // The model narrates a complete call inside the thinking block and closes thinking without
+    // emitting anything in the content channel. The call must be promoted to structured output.
+    const std::string generated =
+        "thought\n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+        "</parameter>\n</function>\n</tool_call>\n</think>";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    int failures = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                         "salvage input did not reach the terminal transaction");
+    const auto output = session.commit_preview();
+    failures +=
+        check(channel_text(output, ninfer::OutputChannel::Reasoning) ==
+                  "thought\n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+                  "</parameter>\n</function>\n</tool_call>\n" &&
+                  channel_text(output, ninfer::OutputChannel::Content).empty(),
+              "salvage altered the published reasoning or content channel");
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
+                      "frontend did not salvage the reasoning tool call");
+    if (!calls.empty()) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("taskId") == "1",
+                          "salvage did not preserve normalized tool arguments");
+    }
+    failures += check(session.tool_call_parse_diagnostics() ==
+                          ninfer::ToolCallParseDiagnostics{
+                              .marker_seen               = true,
+                              .structured_call_count     = 1,
+                              .empty_arguments_omitted   = 0,
+                              .schema_mismatch_arguments = 0,
+                              .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+                              .salvaged_from_reasoning   = true,
+                          },
+                      "salvage did not mark its parse diagnostics");
+
+    // A turn whose content channel carries prose keeps the reasoning call unpromoted.
+    auto prose_session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    const std::string generated_with_content = generated + "\n\nanswer";
+    const std::vector<ninfer::TokenId> prose_tokens = fixture_tokenizer().encode(
+        generated_with_content);
+    const auto prose_decision =
+        prose_session.preview_model(prose_tokens, static_cast<std::uint32_t>(prose_tokens.size()),
+                                    ninfer::FinishReason::OutputLimit);
+    const auto prose_output = prose_session.commit_preview();
+    failures += check(
+        prose_decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+            channel_text(prose_output, ninfer::OutputChannel::Content) == "answer" &&
+            prose_session.take_tool_calls().empty() &&
+            !prose_session.tool_call_parse_diagnostics().salvaged_from_reasoning,
+        "salvage executed on a turn whose content channel answered in prose");
+    return failures;
+}
+
+int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    auto session =
+        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 3});
+
+    const std::vector<ninfer::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
+    const auto decision = session.preview_model(tokens, 10, ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(!decision.finished() &&
+                  decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "a quoted close marker suppressed the thinking budget control");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "x</think>x" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "a quoted close marker was not preserved in the reasoning channel");
+    return failures;
+}
+
+int test_tool_marker_after_quoted_marker() {
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string generated = "The failure looked like " + quoted +
+                                  "\nThen the real call:\n"
+                                  "<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n"
+                                  "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+
+    int failures = 0;
+    failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          calls.size() == 1 && calls.front().name == "bash",
+                      "a quoted malformed marker demoted the following real tool call");
+    if (calls.size() == 1) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("command") == "echo ok",
+                          "the recovered tool call lost its arguments");
+    }
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "The failure looked like " + quoted + "\nThen the real call:",
+                      "the quoted marker was not preserved as ordinary content");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -1828,6 +2068,434 @@ int test_thinking_budget_control(const Frontend& frontend) {
     const auto raw_output = raw_session.commit_preview();
     failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
                       "raw output did not preserve the inserted control representation");
+    return failures;
+}
+
+int test_thinking_budget_message(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    ninfer::StopPolicy stop;
+    auto session = frontend.make_output_session(
+        prompt, stop, {},
+        ninfer::ThinkingControlOptions{.budget = 2, .budget_message = "Stop looping now."});
+    int failures = check(session.model_token_budget_remaining(64) == 2,
+                         "budgeted message session did not clamp the model round license");
+
+    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const auto boundary =
+        session.preview_model(model_tokens, 64, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(boundary.accepted_tokens == model_tokens.size() && !boundary.finished() &&
+                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "message budget boundary did not request target control");
+    (void)session.commit_preview();
+
+    const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+    failures += check(pending.size() > 1,
+                      "budget message did not produce a multi-token control span");
+    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    failures += check(
+        throws_invalid_argument([&] {
+            session.validate_generation_capacity(static_cast<std::uint32_t>(2 + control.size()));
+        }),
+        "planning accepted a capacity that cannot fit the message control plus a post-close "
+        "model token");
+    session.validate_generation_capacity(static_cast<std::uint32_t>(3 + control.size()));
+    const auto control_decision =
+        session.preview_control(control, static_cast<std::uint32_t>(control.size() + 2));
+    failures += check(control_decision.accepted_tokens == control.size() &&
+                          !control_decision.finished(),
+                      "message thinking control was not accepted");
+    const auto control_output = session.commit_preview();
+    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                          "Stop looping now.\n" &&
+                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                      "the budget message was not published through the reasoning channel");
+    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    failures += check(stats.configured_budget == 2 && stats.model_thinking_tokens == 2 &&
+                          stats.injected_tokens == control.size() && stats.applied &&
+                          session.pending_control_tokens().empty(),
+                      "message thinking control accounting is incorrect");
+    const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 64,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!content_decision.finished(), "post-control model token unexpectedly terminated");
+    const auto content_output = session.commit_preview();
+    failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+                      "post-control model output did not enter the content channel");
+
+    auto raw_prompt  = thinking_prompt(frontend);
+    auto raw_session = frontend.make_output_session(
+        raw_prompt, {}, ninfer::OutputOptions{.raw = true},
+        ninfer::ThinkingControlOptions{.budget = 2, .budget_message = "Stop looping now."});
+    (void)raw_session.preview_model(std::array<ninfer::TokenId, 2>{0, 0}, 64,
+                                    ninfer::FinishReason::OutputLimit);
+    (void)raw_session.commit_preview();
+    const std::vector<ninfer::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
+                                                  raw_session.pending_control_tokens().end());
+    (void)raw_session.preview_control(raw_tokens, static_cast<std::uint32_t>(raw_tokens.size() + 2));
+    const auto raw_output = raw_session.commit_preview();
+    failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) ==
+                          "Stop looping now.\n</think>\n\n",
+                      "raw output did not preserve the message-derived control representation");
+
+    auto canonical_prompt  = thinking_prompt(frontend);
+    auto canonical_session = frontend.make_output_session(
+        canonical_prompt, stop, {},
+        ninfer::ThinkingControlOptions{.budget = 2, .budget_message = {}});
+    const auto canonical_boundary =
+        canonical_session.preview_model(model_tokens, 64, ninfer::FinishReason::OutputLimit);
+    failures += check(
+        canonical_boundary.continuation ==
+            ninfer::runtime::ContinuationAction::ApplyTargetControl,
+        "empty budget message did not keep the canonical control armed");
+    (void)canonical_session.commit_preview();
+    const std::vector<ninfer::TokenId> canonical(
+        canonical_session.pending_control_tokens().begin(),
+        canonical_session.pending_control_tokens().end());
+    (void)canonical_session.preview_control(
+        canonical, static_cast<std::uint32_t>(canonical.size() + 2));
+    const auto canonical_output = canonical_session.commit_preview();
+    failures += check(channel_text(canonical_output, ninfer::OutputChannel::Reasoning) ==
+                          kThinkingControlGuidance,
+                      "an empty budget message changed the canonical guidance");
+    return failures;
+}
+
+// The Engine's commit_pending admits a model-round decision only when the licensed prefix
+// satisfies this contract: a non-terminal row licenses the whole produced width, except a row
+// continued by target control (the empty-turn retry), which licenses the prefix up to a
+// mid-row stop token. The mid-row retry decisions below must satisfy it.
+[[nodiscard]] bool engine_licenses(const ninfer::runtime::OutputDecision& decision,
+                                   std::uint32_t produced) {
+    const bool partial_nonterminal =
+        decision.accepted_tokens < produced && !decision.finished() &&
+        decision.continuation != ninfer::runtime::ContinuationAction::ApplyTargetControl;
+    return decision.accepted_tokens != 0 && decision.accepted_tokens <= produced &&
+           !partial_nonterminal &&
+           (!decision.finished() ||
+            decision.continuation == ninfer::runtime::ContinuationAction::Decode) &&
+           (!decision.prefix_execution_split_after.has_value() ||
+            (*decision.prefix_execution_split_after >= 1 &&
+             *decision.prefix_execution_split_after <= decision.accepted_tokens));
+}
+
+int test_empty_turn_retry(const Frontend& frontend) {
+    const std::string message = "Stop now and answer.";
+    const std::vector<ninfer::TokenId> message_span = fixture_tokenizer().encode(message);
+    const std::vector<ninfer::TokenId> close_span = fixture_tokenizer().encode(
+        message + std::string(fi::kCanonicalReasoningCloseSerialization));
+    int failures = 0;
+
+    // The retry is a budget-exhaustion remedy: a silent stop with headroom left ends the turn
+    // normally and reserves nothing, whether the thinking phase is open or closed.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 20, .budget_message = message});
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("a</think>\n");
+        tokens.push_back(6);
+        const auto decision =
+            session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              decision.continuation ==
+                                  ninfer::runtime::ContinuationAction::Decode &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry,
+                          "a silent stop with budget headroom armed the empty-turn retry");
+        failures += check(session.control_suffix_tokens() == 0,
+                          "a non-exhausted thinking budget reserved the control suffix");
+    }
+
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 20, .budget_message = message});
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("thinking");
+        tokens.push_back(6);
+        const auto decision =
+            session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry,
+                          "an open silent stop with budget headroom armed the empty-turn retry");
+    }
+
+    // Without a budget there is no exhaustion to remedy: thinking and non-thinking silent
+    // stops both end normally.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{.budget_message = message});
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("a</think>\n");
+        tokens.push_back(6);
+        const auto decision =
+            session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry &&
+                              session.control_suffix_tokens() == 0,
+                          "a budget-less silent stop armed the empty-turn retry");
+    }
+
+    {
+        ninfer::ChatMessage chat;
+        chat.role = ninfer::ChatRole::User;
+        chat.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(chat));
+        input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+        input.options.enable_thinking = false;
+        auto prompt  = frontend.prepare(std::move(input));
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{.budget_message = message});
+        failures += check(session.control_suffix_tokens() == 0,
+                          "a non-thinking request reserved the control suffix");
+        const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{6}, 1,
+                                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry,
+                          "a non-thinking silent stop armed the empty-turn retry");
+    }
+
+    // An exhausted thinking budget that closed naturally: the bare message is injected once
+    // through the reasoning channel, the turn continues, and a second stop ends normally.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 10, .budget_message = message});
+        const auto first =
+            session.preview_model(fixture_tokens("a</think>\n"), 64,
+                                  ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(!first.finished() &&
+                              first.continuation ==
+                                  ninfer::runtime::ContinuationAction::Decode,
+                          "an exhausted closed budget did not continue decoding");
+        failures += check(session.control_suffix_tokens() == close_span.size(),
+                          "an exhausted thinking budget did not reserve the retry span");
+
+        const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{6}, 64,
+                                                    ninfer::FinishReason::OutputLimit);
+        failures += check(decision.accepted_tokens == 1 && !decision.finished() &&
+                              decision.continuation ==
+                                  ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                          "an exhausted thinking budget did not arm the empty-turn retry");
+        (void)session.commit_preview();
+
+        const auto pending = session.pending_control_tokens();
+        failures += check(pending.size() == message_span.size() &&
+                              std::equal(pending.begin(), pending.end(), message_span.begin()),
+                          "the closed retry did not expose the bare message span");
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        const auto control_decision = session.preview_control(control, control.size());
+        failures += check(control_decision.accepted_tokens == control.size() &&
+                              !control_decision.finished(),
+                          "the closed retry control was not accepted");
+        const auto control_output = session.commit_preview();
+        failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                              message &&
+                              channel_text(control_output, ninfer::OutputChannel::Content)
+                                  .empty(),
+                          "the closed retry message was not published through the reasoning "
+                          "channel");
+        const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+        failures += check(stats.empty_turn_retry && !stats.applied &&
+                              stats.configured_budget == 10 &&
+                              stats.model_thinking_tokens == 10 &&
+                              stats.injected_tokens == control.size() &&
+                              session.control_suffix_tokens() == 0,
+                          "the closed retry accounting or reservation is incorrect");
+
+        const auto content = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 2,
+                                                   ninfer::FinishReason::OutputLimit);
+        failures += check(!content.finished(), "model output after the retry terminated");
+        const auto content_output = session.commit_preview();
+        failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+                          "model output after the retry did not enter the content channel");
+
+        const auto again = session.preview_model(std::array<ninfer::TokenId, 1>{6}, 1,
+                                                 ninfer::FinishReason::OutputLimit);
+        failures += check(again.finish_reason == ninfer::FinishReason::StopToken &&
+                              again.continuation ==
+                                  ninfer::runtime::ContinuationAction::Decode,
+                          "the empty-turn retry fired a second time");
+        (void)session.commit_preview();
+        failures += check(session.pending_control_tokens().empty() &&
+                              session.thinking_stats().injected_tokens == control.size(),
+                          "the second stop re-injected the retry message");
+    }
+
+    // An exhausted thinking budget that is still open: the retry carries the close marker,
+    // exactly like the budget-cutoff span, and closes both phases.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 9, .budget_message = message});
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("thinking");
+        tokens.push_back(6);
+        const auto decision = session.preview_model(
+            tokens, static_cast<std::uint32_t>(close_span.size() + 9U),
+            ninfer::FinishReason::OutputLimit);
+        failures += check(decision.accepted_tokens == tokens.size() && !decision.finished() &&
+                              decision.continuation ==
+                                  ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                          "an exhausted open budget did not arm the empty-turn retry");
+        (void)session.commit_preview();
+
+        const auto pending = session.pending_control_tokens();
+        failures += check(pending.size() == close_span.size() &&
+                              std::equal(pending.begin(), pending.end(), close_span.begin()),
+                          "the open retry did not expose the message-plus-close span");
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        const auto control_decision = session.preview_control(control, control.size());
+        failures += check(control_decision.accepted_tokens == control.size() &&
+                              !control_decision.finished() &&
+                              control_decision.prefix_execution_split_after == control.size(),
+                          "the open retry control was not accepted atomically");
+        const auto control_output = session.commit_preview();
+        failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                              message + "\n" &&
+                              channel_text(control_output, ninfer::OutputChannel::Content)
+                                  .empty(),
+                          "the open retry did not close both phases with the message in "
+                          "reasoning");
+        const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+        failures += check(stats.empty_turn_retry && !stats.applied &&
+                              stats.model_thinking_tokens == 9 &&
+                              stats.injected_tokens == control.size(),
+                          "the open retry accounting is incorrect");
+        const auto content = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1,
+                                                   ninfer::FinishReason::OutputLimit);
+        const auto content_output = session.commit_preview();
+        failures += check(content.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              channel_text(content_output, ninfer::OutputChannel::Content) ==
+                                  "x",
+                          "model output after the open retry did not enter the content channel");
+    }
+
+    // The loop case: the model burns the full budget, the cutoff injects the guidance, and the
+    // model still stops silently - the retry re-injects the bare message once.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 10, .budget_message = message});
+        const auto cutoff_row =
+            session.preview_model(fixture_tokens("aaaaaaaaaa"), 64,
+                                  ninfer::FinishReason::OutputLimit);
+        failures += check(cutoff_row.continuation ==
+                              ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                          "the budget cutoff did not arm the control span");
+        (void)session.commit_preview();
+        std::vector<ninfer::TokenId> control(session.pending_control_tokens().begin(),
+                                             session.pending_control_tokens().end());
+        (void)session.preview_control(control, control.size());
+        (void)session.commit_preview();
+        failures += check(session.thinking_stats().applied &&
+                              session.thinking_stats().model_thinking_tokens == 10,
+                          "the cutoff guidance was not applied");
+
+        const auto stop = session.preview_model(std::array<ninfer::TokenId, 1>{6}, 64,
+                                                ninfer::FinishReason::OutputLimit);
+        failures += check(!stop.finished() &&
+                              stop.continuation ==
+                                  ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                          "a post-cutoff silent stop did not arm the empty-turn retry");
+        (void)session.commit_preview();
+        const auto pending = session.pending_control_tokens();
+        failures += check(pending.size() == message_span.size() &&
+                              std::equal(pending.begin(), pending.end(), message_span.begin()),
+                          "the post-cutoff retry did not expose the bare message span");
+        const std::vector<ninfer::TokenId> retry(pending.begin(), pending.end());
+        (void)session.preview_control(retry, retry.size());
+        const auto retry_output = session.commit_preview();
+        failures += check(channel_text(retry_output, ninfer::OutputChannel::Reasoning) ==
+                              message &&
+                              channel_text(retry_output, ninfer::OutputChannel::Content)
+                                  .empty(),
+                          "the post-cutoff retry message was not published through the "
+                          "reasoning channel");
+        failures += check(session.thinking_stats().applied &&
+                              session.thinking_stats().empty_turn_retry,
+                          "the post-cutoff retry accounting is incorrect");
+        const auto content = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 2,
+                                                   ninfer::FinishReason::OutputLimit);
+        const auto content_output = session.commit_preview();
+        failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+                          "model output after the post-cutoff retry missed the content channel");
+    }
+
+    // A stop token mid-row, with the budget exhausted: the decision licenses the prefix up to
+    // the stop and satisfies the engine's licensed-prefix contract (the shape the engine once
+    // rejected with "invalid licensed prefix").
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 10, .budget_message = message});
+        const std::size_t prefix = fixture_tokens("a</think>\n").size();
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("a</think>\n");
+        tokens.push_back(6);
+        tokens.push_back(0);
+        const auto decision = session.preview_model(
+            tokens, static_cast<std::uint32_t>(close_span.size() + tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        const std::uint32_t produced = static_cast<std::uint32_t>(tokens.size());
+        failures += check(decision.accepted_tokens == prefix + 1U &&
+                              decision.accepted_tokens < produced && !decision.finished() &&
+                              decision.continuation ==
+                                  ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                          "an exhausted mid-row stop did not license the prefix up to the stop");
+        failures += check(engine_licenses(decision, produced),
+                          "an exhausted mid-row retry decision violated the engine's "
+                          "licensed-prefix contract");
+        (void)session.commit_preview();
+        const auto pending = session.pending_control_tokens();
+        failures += check(pending.size() == message_span.size() &&
+                              std::equal(pending.begin(), pending.end(), message_span.begin()),
+                          "the exhausted mid-row retry did not expose the bare message span");
+    }
+
+    // A turn with content is not retried even when the budget is exhausted.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget = 2, .budget_message = message});
+        const std::array<ninfer::TokenId, 3> tokens{3, 4, 6};
+        const auto decision =
+            session.preview_model(tokens, 3, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry,
+                          "a nonempty exhausted turn was retried");
+    }
+
+    // Without a configured message the retry is disabled.
+    {
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(prompt, {}, {}, {});
+        std::vector<ninfer::TokenId> tokens = fixture_tokens("a</think>\n");
+        tokens.push_back(6);
+        const auto decision =
+            session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                              session.pending_control_tokens().empty() &&
+                              !session.thinking_stats().empty_turn_retry,
+                          "the retry fired without a configured message");
+    }
     return failures;
 }
 
@@ -2223,8 +2891,16 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
+    failures += test_reasoning_close_requires_boundary(frontend);
+    failures += test_reasoning_close_resolves_at_terminal(frontend);
+    failures += test_tool_call_after_boundaryless_think_close(frontend);
+    failures += test_reasoning_tool_salvage(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_thinking_budget_message(frontend);
+    failures += test_empty_turn_retry(frontend);
+    failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

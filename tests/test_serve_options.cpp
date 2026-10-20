@@ -60,6 +60,8 @@ int main() {
                       "model id override is unexpectedly configured by default");
     failures += check(!defaults.default_thinking_budget,
                       "thinking budget is unexpectedly limited by default");
+    failures += check(defaults.reasoning_budget_message.empty(),
+                      "a reasoning budget message is unexpectedly configured by default");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -103,6 +105,12 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
+    const ServeOptions budget_message = parse(
+        {"ninfer-serve", "model.ninfer", "--reasoning-budget-message", "Stop looping now."});
+    failures += check(budget_message.reasoning_budget_message == "Stop looping now.",
+                      "--reasoning-budget-message did not preserve its value");
+    failures += check(kv_help.find("--reasoning-budget-message") != std::string::npos,
+                      "serve help omits the reasoning budget message flag");
 
     bool empty_model_id_rejected = false;
     try {

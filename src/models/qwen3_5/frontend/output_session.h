@@ -87,6 +87,7 @@ private:
     OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
+                  std::shared_ptr<const std::vector<TokenId>> retry_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output);
     std::unique_ptr<Impl> impl_;
 

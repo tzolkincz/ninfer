@@ -91,6 +91,7 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"structured_call_count", diagnostics.structured_call_count},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
+                {"salvaged_from_reasoning", diagnostics.salvaged_from_reasoning},
                 {"fallback_reason",
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
 }
@@ -501,6 +502,10 @@ std::string format_server_start_json(
     if (options.default_thinking_budget) {
         default_thinking_budget = *options.default_thinking_budget;
     }
+    Json default_reasoning_budget_message = nullptr;
+    if (!options.reasoning_budget_message.empty()) {
+        default_reasoning_budget_message = options.reasoning_budget_message;
+    }
 
     record["server"] =
         Json{{"host", options.host},
@@ -520,6 +525,8 @@ std::string format_server_start_json(
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
+             {"default_reasoning_budget_message",
+              std::move(default_reasoning_budget_message)},
              {"default_preserve_thinking",
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
@@ -656,6 +663,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
              {"thinking_control_tokens", outcome.thinking.injected_tokens},
              {"thinking_control_applied", outcome.thinking.applied},
+             {"empty_turn_retry", outcome.thinking.empty_turn_retry},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)},
              {"prompt_ngram_overlap", optional_json(outcome.metrics.prompt_ngram_overlap)}};
@@ -666,6 +674,27 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
+    return record.dump();
+}
+
+// Captures the raw model output of tool turns that did not yield a structured call, so a
+// silent loss is diagnosable at the byte level: the reasoning and content channels exactly as
+// published, alongside the parse diagnostics that explain why the call was not recovered.
+std::string format_raw_turn_json(const std::string& server_instance_id, std::uint64_t timestamp,
+                                 const RequestLogContext& context,
+                                 const GenerationOutcome& outcome) {
+    Json record       = event_base(server_instance_id, timestamp, "raw_turn");
+    record["request"] = request_json(context);
+    record["result"] =
+        Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
+             {"completion_tokens", outcome.completion_tokens},
+             {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
+             {"thinking_control_applied", outcome.thinking.applied},
+             {"empty_turn_retry", outcome.thinking.empty_turn_retry},
+             {"tool_call_count", outcome.tool_calls.size()},
+             {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
+    record["reasoning"] = outcome.reasoning;
+    record["content"]   = outcome.text;
     return record.dump();
 }
 
@@ -913,6 +942,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
     }
+    raw_turns_.open(path_ + ".raw-turns.jsonl", std::ios::out | std::ios::app);
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
@@ -945,6 +975,13 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
                                          const GenerationOutcome& outcome) {
     if (!enabled()) { return; }
     append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+    const bool failed_tool_turn =
+        context.tool_count > 0 &&
+        (outcome.tool_calls.empty() ||
+         outcome.tool_call_parse.fallback_reason != ninfer::ToolCallParseFallbackReason::None);
+    if (failed_tool_turn) {
+        append_raw_turn(format_raw_turn_json(server_instance_id_, unix_time_ms(), context, outcome));
+    }
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,
@@ -974,6 +1011,13 @@ void JsonlRequestLog::append(std::string record) {
         logger_->error("request log disabled | write failed | {}",
                        product::format_pretty_text(path_));
     }
+}
+
+void JsonlRequestLog::append_raw_turn(std::string record) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!raw_turns_.is_open()) { return; }
+    raw_turns_ << record << '\n';
+    raw_turns_.flush();
 }
 
 } // namespace ninfer::serve

@@ -926,9 +926,42 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    std::shared_ptr<const std::vector<TokenId>> control = impl_->thinking_control_tokens;
+    std::shared_ptr<const std::vector<TokenId>> retry;
+    if (!thinking.budget_message.empty()) {
+        const std::string text =
+            thinking.budget_message + std::string(fi::kCanonicalReasoningCloseSerialization);
+        const std::vector<TokenId> encoded = impl_->tokenizer->encode(text);
+        if (encoded.empty()) {
+            throw std::invalid_argument(
+                "reasoning budget message cannot be encoded to any tokens");
+        }
+        const std::string presented =
+            impl_->tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
+        if (presented != text) {
+            throw std::invalid_argument(
+                "reasoning budget message does not round-trip through the tokenizer");
+        }
+        control = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        // The same message without the close marker is the span re-injected when a turn ends on
+        // its own stop token without a message after the thinking budget was exhausted and the
+        // thinking phase is already closed: the decoder state must not be re-opened, so the span
+        // publishes to the reasoning channel as plain text.
+        const std::vector<TokenId> retry_encoded = impl_->tokenizer->encode(thinking.budget_message);
+        if (retry_encoded.empty()) {
+            throw std::invalid_argument(
+                "reasoning budget message cannot be encoded to any tokens");
+        }
+        if (impl_->tokenizer->decode(retry_encoded, fi::DecodeOptions{.skip_special_tokens = false})
+            != thinking.budget_message) {
+            throw std::invalid_argument(
+                "reasoning budget message does not round-trip through the tokenizer");
+        }
+        retry = std::make_shared<const std::vector<TokenId>>(std::move(retry_encoded));
+    }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
-                         prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+                         prompt.data_->starts_in_reasoning, thinking, std::move(control),
+                         std::move(retry), prompt.data_->tool_call_output);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

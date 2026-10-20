@@ -316,6 +316,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking != false) {
+        // The message doubles as the empty-turn retry text; both the cutoff and the retry are
+        // thinking-only, so the message flows only with a thinking budget.
+        options.execution.thinking.budget_message = server.reasoning_budget_message;
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }

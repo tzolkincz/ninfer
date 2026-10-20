@@ -462,6 +462,10 @@ struct ThinkingControlOptions {
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
+    // Message injected before the thinking-close control suffix when the budget exhausts the
+    // thinking phase, replacing the model's canonical early-close guidance. Empty keeps the
+    // canonical guidance; the model frontend tokenizes it together with the close marker.
+    std::string budget_message;
 };
 
 struct ExecutionOptions {
@@ -552,6 +556,7 @@ struct ToolCallParseDiagnostics {
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    bool salvaged_from_reasoning                = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -921,6 +926,9 @@ struct ThinkingBudgetStats {
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
+    // The turn ended on its own stop token without a message; the configured message was
+    // re-injected once so the model could still answer.
+    bool empty_turn_retry = false;
 };
 
 enum class PrefixReusePath : std::uint8_t {

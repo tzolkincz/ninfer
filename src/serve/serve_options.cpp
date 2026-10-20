@@ -184,6 +184,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--reasoning-budget-message MESSAGE] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -265,6 +266,11 @@ std::string serve_usage_text(const char* argv0) {
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
+           "       --reasoning-budget-message MESSAGE replaces the canonical early-close "
+           "guidance with MESSAGE when the thinking budget closes a turn, and is re-injected "
+           "once in-stream when a turn ends on its own stop token without a message after the "
+           "thinking budget is exhausted; unset keeps the canonical guidance and disables the "
+           "empty-turn retry\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -526,6 +532,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--reasoning-budget-message") {
+            options.reasoning_budget_message = require_value("--reasoning-budget-message");
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-vision") { // also drops a profile's Vision device and token cap

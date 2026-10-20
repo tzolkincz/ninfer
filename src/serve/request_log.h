@@ -53,6 +53,10 @@ std::string format_request_done_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome);
+std::string format_raw_turn_json(const std::string& server_instance_id,
+                                 std::uint64_t timestamp_unix_ms,
+                                 const RequestLogContext& context,
+                                 const GenerationOutcome& outcome);
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
@@ -91,10 +95,12 @@ public:
 
 private:
     void append(std::string record);
+    void append_raw_turn(std::string record);
 
     std::string path_;
     std::string server_instance_id_;
     std::ofstream output_;
+    std::ofstream raw_turns_;
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
     bool failed_ = false;

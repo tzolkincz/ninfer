@@ -235,6 +235,26 @@ post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
+`--reasoning-budget-message MESSAGE` replaces Qwen's canonical early-close guidance with MESSAGE
+at that boundary: the control suffix becomes MESSAGE followed by the canonical close marker,
+tokenized together as one span. Unset or empty keeps the canonical guidance and disables the
+empty-turn retry below. The same capacity rules apply: the complete message-derived suffix plus
+one post-close model token must fit, and the inserted tokens still count in completion usage and
+the request output budget.
+
+The configured message also backs the empty-turn retry, the loop remedy: when a thinking budget
+is set, the model has actually exhausted it, and the turn nevertheless ends on its own stop token
+with no message - whitespace-only content, no tool call, and no reasoning-narrated call to
+salvage - the server re-injects the message once, in-stream, as a forced control span and the
+model continues within the same request. An open thinking phase receives the message with the
+canonical close marker, identical to the budget-cutoff span; a closed phase receives the message
+alone, published on the reasoning channel. A silent stop with budget headroom left - or a request
+without a thinking budget - ends the turn normally, with no injection.
+The retry requires that the complete span fit the remaining output budget; the server reserves it
+from the moment the budget exhausts. One retry per request: if the model ends on a stop token again
+right after the retry, the turn terminates normally. Stop-string, output-limit, context-limit and
+cancellation terminations are not retried.
+
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The server folds the
 other standard values onto the tiers the Qwen3.8 template distinguishes before rendering: `high`,
 `max`, and `adaptive` render as `xhigh`; `minimal` renders as `low`; `low`, `medium`, and `xhigh`
@@ -819,6 +839,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
+| `--reasoning-budget-message MESSAGE` | replaces the canonical early-close guidance injected when the thinking budget closes a thinking turn, and re-injects the message once in-stream when a turn ends on its own stop token without a message after the thinking budget is exhausted (empty-turn retry); unset keeps the canonical guidance and disables the retry | unset (canonical guidance) |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-device N` | CUDA device that holds the Vision tower and encodes; one of `--devices` at `--tp 2`; see [Two GPUs](#two-gpus) | `--device` |
 | `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized and the encode workspace is planned for `N` | `16384` |

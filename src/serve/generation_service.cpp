@@ -395,6 +395,7 @@ PreparedRequest GenerationService::prepare_impl(
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
+            request_options.execution.thinking.budget_message.clear();
             prepared.thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
